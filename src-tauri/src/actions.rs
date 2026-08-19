@@ -115,7 +115,11 @@ where
 }
 
 fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool {
-    style == OverlayStyle::Live && is_streaming
+    // Windows draws the overlay natively with no live-transcription streaming
+    // panel, so the streaming-overlay path (a WebView event) would be a no-op
+    // there. Route the transcribing/processing phases through the native
+    // overlay's state label instead (show_transcribing_/show_processing_...).
+    !cfg!(target_os = "windows") && style == OverlayStyle::Live && is_streaming
 }
 
 async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {

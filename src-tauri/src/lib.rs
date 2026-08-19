@@ -13,6 +13,7 @@ mod input;
 mod llm_client;
 mod managers;
 mod memory;
+mod native_overlay;
 mod overlay;
 mod paste_tx;
 pub mod portable;
@@ -93,6 +94,41 @@ fn build_console_filter() -> env_filter::Filter {
     builder.build()
 }
 
+/// Build the main settings window (Webview window labeled "main").
+///
+/// Created once at startup and re-created on demand on Windows whenever the
+/// user closes it — closing destroys the WebView2 instance so it stops
+/// holding memory while the app keeps running from the tray (see the
+/// `CloseRequested` handler). On macOS/Linux the window is only ever hidden,
+/// so it is built exactly once at startup and reused.
+fn create_main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, tauri::Error> {
+    let mut win_builder =
+        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("/".into()))
+            .title("Handy")
+            .inner_size(680.0, 570.0)
+            .min_inner_size(680.0, 570.0)
+            .resizable(true)
+            .maximizable(true)
+            .visible(false);
+
+    if let Some(data_dir) = portable::data_dir() {
+        win_builder = win_builder.data_directory(data_dir.join("webview"));
+    }
+
+    let window = win_builder.build()?;
+
+    // Apply the persisted appearance theme to the native title bar before the
+    // window is shown, so it matches the in-app palette without a flash of the
+    // wrong theme. Re-applied on every recreate; see `apply_window_theme`.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let theme = get_settings(app).theme;
+        shortcut::apply_window_theme(app, theme);
+    }
+
+    Ok(window)
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(main_window) = app.get_webview_window("main") {
         if let Err(e) = main_window.unminimize() {
@@ -113,11 +149,36 @@ fn show_main_window(app: &AppHandle) {
         return;
     }
 
-    let webview_labels = app.webview_windows().keys().cloned().collect::<Vec<_>>();
-    log::error!(
-        "Main window not found. Webview labels: {:?}",
-        webview_labels
-    );
+    // On Windows the main window is destroyed on close to free WebView2
+    // memory; recreate it here when the user reopens the app from the tray
+    // or a single-instance relaunch. On macOS/Linux the window only hides
+    // (see the CloseRequested handler), so it already exists and the branch
+    // above is taken — this path is effectively desktop-Windows-only.
+    #[cfg(target_os = "windows")]
+    {
+        match create_main_window(app) {
+            Ok(window) => {
+                if let Err(e) = window.show() {
+                    log::error!("Failed to show recreated webview window: {}", e);
+                }
+                if let Err(e) = window.set_focus() {
+                    log::error!("Failed to focus recreated webview window: {}", e);
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to recreate main window: {}", e);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let webview_labels = app.webview_windows().keys().cloned().collect::<Vec<_>>();
+        log::error!(
+            "Main window not found. Webview labels: {:?}",
+            webview_labels
+        );
+    }
 }
 
 #[allow(unused_variables)]
@@ -886,31 +947,11 @@ pub fn run(cli_args: CliArgs) {
                 return Ok(());
             }
 
-            // Create main window programmatically so we can set data_directory
-            // for portable mode (redirects WebView2 cache to portable Data dir)
-            let mut win_builder =
-                tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("/".into()))
-                    .title("Handy")
-                    .inner_size(680.0, 570.0)
-                    .min_inner_size(680.0, 570.0)
-                    .resizable(true)
-                    .maximizable(true)
-                    .visible(false);
-
-            if let Some(data_dir) = portable::data_dir() {
-                win_builder = win_builder.data_directory(data_dir.join("webview"));
-            }
-
-            win_builder.build()?;
+            // Create main window programmatically (extracted so it can be
+            // recreated on close on Windows — see create_main_window).
+            create_main_window(app.handle())?;
 
             let mut settings = get_settings(app.handle());
-
-            // Apply the persisted appearance theme to the native title bar before
-            // the window is shown, so it matches the in-app palette without a flash
-            // of the wrong theme. See `apply_window_theme` for what this does per
-            // platform.
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            shortcut::apply_window_theme(app.handle(), settings.theme);
 
             // CLI --debug flag overrides debug_mode and log level (runtime-only, not persisted)
             if cli_args.debug {
@@ -975,24 +1016,38 @@ pub fn run(cli_args: CliArgs) {
         })
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
-                let _res = window.hide();
-
-                #[cfg(target_os = "macos")]
+                // On Windows, let the window close (and the WebView2 instance
+                // be destroyed) so it releases its memory while the app keeps
+                // running from the tray. show_main_window recreates it on
+                // demand. On macOS/Linux the window is only hidden and reused
+                // — recreating a webview there is costlier and the app's
+                // Dock/taskbar reentry differs.
+                #[cfg(target_os = "windows")]
                 {
-                    let settings = get_settings(window.app_handle());
-                    let tray_visible =
-                        settings.show_tray_icon && !window.app_handle().state::<CliArgs>().no_tray;
-                    if tray_visible {
-                        // Tray is available: hide the dock icon, app lives in the tray
-                        let res = window
-                            .app_handle()
-                            .set_activation_policy(tauri::ActivationPolicy::Accessory);
-                        if let Err(e) = res {
-                            log::error!("Failed to set activation policy: {}", e);
+                    // Allow the close to proceed; do not prevent it.
+                    let _ = api; // silence unused on non-windows
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    api.prevent_close();
+                    let _res = window.hide();
+
+                    #[cfg(target_os = "macos")]
+                    {
+                        let settings = get_settings(window.app_handle());
+                        let tray_visible = settings.show_tray_icon
+                            && !window.app_handle().state::<CliArgs>().no_tray;
+                        if tray_visible {
+                            // Tray is available: hide the dock icon, app lives in the tray
+                            let res = window
+                                .app_handle()
+                                .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                            if let Err(e) = res {
+                                log::error!("Failed to set activation policy: {}", e);
+                            }
                         }
+                        // No tray: keep the dock icon visible so the user can reopen
                     }
-                    // No tray: keep the dock icon visible so the user can reopen
                 }
             }
             tauri::WindowEvent::ThemeChanged(theme) => {
@@ -1009,6 +1064,34 @@ pub fn run(cli_args: CliArgs) {
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {
                 show_main_window(app);
+            }
+            // On Windows the main window is destroyed on close (freeing
+            // WebView2 memory). When that was the last window, Tauri would
+            // otherwise exit the app; keep it alive so the tray icon and
+            // global shortcuts keep working. A programmatic exit (tray
+            // "Quit" -> `app.exit(0)`) carries `code = Some(_)` and must be
+            // allowed through so the user can actually quit.
+            #[cfg(target_os = "windows")]
+            tauri::RunEvent::ExitRequested { api, code, .. } => {
+                if code.is_none() {
+                    let s = get_settings(app);
+                    let no_tray = app
+                        .try_state::<CliArgs>()
+                        .map(|c| c.no_tray)
+                        .unwrap_or(true);
+                    if s.show_tray_icon && !no_tray {
+                        log::debug!(
+                            "ExitRequested (last window closed) - keeping Handy alive for tray + shortcuts"
+                        );
+                        api.prevent_exit();
+                    } else {
+                        log::debug!(
+                            "ExitRequested (last window closed, no tray) - exiting"
+                        );
+                    }
+                } else {
+                    log::debug!("ExitRequested (code={:?}) - exiting", code);
+                }
             }
             // Teardown transcribe.cpp before exit
             tauri::RunEvent::Exit => {
