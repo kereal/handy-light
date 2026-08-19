@@ -144,6 +144,65 @@ sudo cp -a src-tauri/transcribe-libs/. /usr/lib/Handy/
 
 Resources only need re-copying if they change upstream (new icons, sounds, models, etc.).
 
+## Windows x86_64 cross-build from WSL (this dev machine)
+
+Handy's Windows binary is cross-compiled from this WSL environment with
+`cargo xwin` (no MSVC needed — clang-cl + the xwin SDK do the job). The
+machine has ~5 GB of RAM, which shapes every flag below.
+
+**Prerequisites (already set up on this machine):**
+
+- `cargo-xwin` installed; the xwin SDK is cached under `~/.cache/cargo-xwin`.
+- `llvm-rc` on `PATH`, symlinked as
+  `~/.local/bin/llvm-rc -> /usr/lib/llvm-19/bin/llvm-rc` (compiles the exe's
+  icon/version resources; without it the build fails with `program not found`).
+- Vulkan SDK headers cached under `~/.cache/vulkansdk-win` (only needed if the
+  `vulkan` feature is re-enabled).
+
+**Build (production binary with the frontend embedded):**
+
+```bash
+cd src-tauri
+CARGO_BUILD_JOBS=2 NUM_JOBS=2 \
+  PATH="$HOME/.local/bin:$PATH" \
+  cargo xwin build --release \
+    --target x86_64-pc-windows-msvc \
+    --features tauri/custom-protocol
+```
+
+- `--features tauri/custom-protocol` is **mandatory**: without it Tauri
+  compiles in dev mode and the WebView tries to load `http://localhost:1420`
+  (the Vite dev server) instead of the embedded `dist/` assets — the app
+  opens but shows "can't load this page" and does nothing.
+- `CARGO_BUILD_JOBS=2 NUM_JOBS=2` caps the build's memory (~3 GB peak). The
+  Vulkan backend is disabled in `Cargo.toml` for Windows x86_64 for the same
+  reason: its shader generator emits a 216 MB `mul_mm.comp.cpp` (4.2M lines)
+  that cannot be compiled within ~6 GB. Re-enable `"vulkan"` in the x86_64
+  `transcribe-cpp` features only when building with ≥16 GB of RAM.
+
+Output: `src-tauri/target/x86_64-pc-windows-msvc/release/handy.exe` with the
+`ggml*.dll` / `transcribe.dll` runtime libraries next to it.
+
+**Installing to the Windows machine** (Windows disk is mounted at `/mnt/c`):
+
+1. Quit Handy completely first (tray icon → Quit). The exe is locked while
+   the app runs and `cp` fails with "Permission denied".
+2. Copy the binary and runtime libraries:
+
+```bash
+DEST=/mnt/c/Users/MAX/AppData/Local/Handy
+SRC=src-tauri/target/x86_64-pc-windows-msvc/release
+cp "$SRC/handy.exe" "$DEST/"
+for f in "$SRC"/ggml*.dll "$SRC/transcribe.dll"; do cp "$f" "$DEST/"; done
+```
+
+Leave the pre-existing `onnxruntime.dll`, MSVC runtimes, and `uninstall.exe`
+in place — they are version-compatible and not produced by this build.
+
+**Note for agent sessions:** long builds launched in the background get killed
+when the launching shell exits — use `setsid nohup ... > log 2>&1 </dev/null &
+` and monitor the log file. Foreground runs with `timeout` also work.
+
 ## Troubleshooting
 
 ### macOS Accessibility remains enabled after a local rebuild
