@@ -39,6 +39,132 @@ use transcribe_rs::{
 const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum audio duration (in seconds) to feed to ONNX CTC models in a single
+/// forward pass. Longer audio is split into chunks to avoid OOM and numerical
+/// instability in the ONNX runtime.
+const CTC_CHUNK_DURATION_SECS: f32 = 30.0;
+/// Overlap between consecutive chunks in seconds. Must be 0 for GigaAM: the
+/// model returns text without per-word timestamps, so any overlapping region
+/// would be transcribed twice and naively concatenated, producing duplicated
+/// words at every boundary.
+const CTC_CHUNK_OVERLAP_SECS: f32 = 0.0;
+/// Sample rate for all ONNX CTC models.
+const CTC_SAMPLE_RATE: u32 = 16_000;
+
+/// Transcribe long audio with a CTC-based ONNX model by splitting it into
+/// non-overlapping chunks, running each chunk through the model, and joining
+/// the results. Short audio (≤ chunk duration) goes through in a single shot.
+///
+/// GigaAM v3 and other CTC ONNX models process the entire mel spectrogram in
+/// one forward pass. For audio longer than ~30 seconds the intermediate
+/// activations can exhaust ONNX Runtime memory or produce degraded output.
+/// Overlap would require per-word timestamps to deduplicate, which GigaAM
+/// does not provide; chunks are therefore placed back-to-back.
+fn transcribe_gigaam_chunked(
+    engine: &mut GigaAMModel,
+    audio: &[f32],
+    options: &TranscribeOptions,
+) -> Result<String> {
+    let chunk_samples = (CTC_CHUNK_DURATION_SECS * CTC_SAMPLE_RATE as f32) as usize;
+    let overlap_samples = (CTC_CHUNK_OVERLAP_SECS * CTC_SAMPLE_RATE as f32) as usize;
+
+    if audio.len() <= chunk_samples {
+        // Short enough for a single pass.
+        return engine
+            .transcribe(audio, options)
+            .map(|r| r.text)
+            .map_err(|e| anyhow::anyhow!("GigaAM transcription failed: {}", e));
+    }
+
+    let audio_secs = audio.len() as f32 / CTC_SAMPLE_RATE as f32;
+    let num_chunks = ((audio.len() + chunk_samples - overlap_samples - 1)
+        / (chunk_samples - overlap_samples))
+        .max(1);
+    info!(
+        "GigaAM chunked transcription: {:.1}s audio → {} chunks of {:.1}s (overlap {:.1}s)",
+        audio_secs, num_chunks, CTC_CHUNK_DURATION_SECS, CTC_CHUNK_OVERLAP_SECS
+    );
+
+    let mut results: Vec<String> = Vec::with_capacity(num_chunks);
+    let mut offset = 0usize;
+
+    while offset < audio.len() {
+        let end = (offset + chunk_samples).min(audio.len());
+        let chunk = &audio[offset..end];
+
+        let chunk_secs = chunk.len() as f32 / CTC_SAMPLE_RATE as f32;
+        debug!(
+            "GigaAM chunk {}/{}: offset={:.1}s, duration={:.1}s",
+            results.len() + 1,
+            num_chunks,
+            offset as f32 / CTC_SAMPLE_RATE as f32,
+            chunk_secs
+        );
+
+        let text = engine
+            .transcribe(chunk, options)
+            .map(|r| r.text)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "GigaAM chunk {}/{} failed at offset {:.1}s: {}",
+                    results.len() + 1,
+                    num_chunks,
+                    offset as f32 / CTC_SAMPLE_RATE as f32,
+                    e
+                )
+            })?;
+
+        if !text.is_empty() {
+            results.push(text);
+        }
+        // Advance by one full chunk (overlap = 0; see CTC_CHUNK_OVERLAP_SECS).
+        let step = chunk_samples.saturating_sub(overlap_samples).max(1);
+        offset += step;
+    }
+
+    let merged = merge_transcription_chunks(&results);
+    info!(
+        "GigaAM chunked transcription complete: {} chunks → {} chars",
+        results.len(),
+        merged.len()
+    );
+    Ok(merged)
+}
+/// Join per-chunk transcription results with single-space separators.
+/// Strips a leading SentencePiece word-boundary marker (`▁` U+2581) when
+/// present, otherwise the second chunk would begin with a stray marker that
+/// the model emits at the start of its own output.
+fn merge_transcription_chunks(chunks: &[String]) -> String {
+    if chunks.is_empty() {
+        return String::new();
+    }
+    if chunks.len() == 1 {
+        return chunks[0].clone();
+    }
+
+    // Use SentencePiece boundary marker for clean merging when available.
+    let has_sp = chunks.iter().any(|c| c.contains('\u{2581}'));
+    if has_sp {
+        let mut merged = chunks[0].clone();
+        for chunk in &chunks[1..] {
+            let trimmed = chunk.trim_start_matches('\u{2581}').trim_start();
+            if !trimmed.is_empty() {
+                merged.push(' ');
+                merged.push_str(trimmed);
+            }
+        }
+        return merged.trim().to_string();
+    }
+
+    // Fallback: simple space-joined concatenation.
+    chunks
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -1365,10 +1491,11 @@ impl TranscriptionManager {
                             .map(|r| r.text)
                             .map_err(|e| anyhow::anyhow!("SenseVoice transcription failed: {}", e))
                     }
-                    LoadedEngine::GigaAM(gigaam_engine) => gigaam_engine
-                        .transcribe(&audio, &TranscribeOptions::default())
-                        .map(|r| r.text)
-                        .map_err(|e| anyhow::anyhow!("GigaAM transcription failed: {}", e)),
+                    LoadedEngine::GigaAM(gigaam_engine) => transcribe_gigaam_chunked(
+                        gigaam_engine,
+                        &audio,
+                        &TranscribeOptions::default(),
+                    ),
                     LoadedEngine::Canary(canary_engine) => {
                         output_was_translated = settings.translate_to_english;
                         let lang = if validated_language == "auto" {
@@ -2439,6 +2566,54 @@ mod tests {
         assert!(matches!(plan.task, Task::Transcribe));
         assert_eq!(plan.language.as_deref(), Some("es"));
         assert_eq!(plan.target_language, None);
+    }
+
+    #[test]
+    fn merge_empty_chunks_returns_empty() {
+        assert_eq!(merge_transcription_chunks(&[]), "");
+    }
+
+    #[test]
+    fn merge_single_chunk_returns_it_unchanged() {
+        let chunks = vec!["hello world".to_string()];
+        assert_eq!(merge_transcription_chunks(&chunks), "hello world");
+    }
+
+    #[test]
+    fn merge_without_sp_marker_joins_with_single_space() {
+        let chunks = vec![
+            "first chunk".to_string(),
+            "second chunk".to_string(),
+            "third chunk".to_string(),
+        ];
+        assert_eq!(
+            merge_transcription_chunks(&chunks),
+            "first chunk second chunk third chunk"
+        );
+    }
+
+    #[test]
+    fn merge_strips_leading_sp_marker_on_subsequent_chunks() {
+        // GigaAM's SentencePiece vocabulary emits `▁` at the start of every
+        // token. After splitting on chunk boundaries each chunk may begin with
+        // that marker — strip a single leading one so we don't emit a stray
+        // character between chunks.
+        let chunks = vec!["▁hello ▁world".to_string(), "▁foo ▁bar".to_string()];
+        assert_eq!(
+            merge_transcription_chunks(&chunks),
+            "▁hello ▁world foo ▁bar"
+        );
+    }
+
+    #[test]
+    fn merge_skips_empty_chunks() {
+        let chunks = vec![
+            "first".to_string(),
+            String::new(),
+            "   ".to_string(),
+            "second".to_string(),
+        ];
+        assert_eq!(merge_transcription_chunks(&chunks), "first second");
     }
 }
 
