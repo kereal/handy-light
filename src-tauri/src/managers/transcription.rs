@@ -93,15 +93,28 @@ fn transcribe_cpp_with_chunking(
     let vad_path = silero_vad_model_path(app_handle)?;
     let silero = SileroVad::new(&vad_path, 0.3)
         .map_err(|e| anyhow::anyhow!("Failed to load Silero VAD from {:?}: {}", vad_path, e))?;
-    let mut vad = transcribe_rs::vad::SmoothedVad::new(Box::new(silero), 15, 15, 2);
+    // Hangover of 30 frames (~900 ms) absorbs short intra-word silences that
+    // would otherwise chop "phrases" into individual words. Onset of 2 frames
+    // matches Handy's offline VAD pipeline so onsets don't drift between
+    // live and batch paths.
+    let mut vad = transcribe_rs::vad::SmoothedVad::new(Box::new(silero), 15, 30, 2);
     let frame_size = vad.frame_size();
 
     let max_chunk_samples = (max_audio_secs * CTC_SAMPLE_RATE as f32) as usize;
     let smart_search_samples = (3.0_f32 * CTC_SAMPLE_RATE as f32) as usize;
+    // Chunks shorter than this are too short for GigaAM to produce meaningful
+    // output (it expects full words; a 0.5 s chunk is usually a single syllable
+    // and yields garbage). When a speech run ends shorter than this, we carry
+    // it forward and merge with the next speech run instead of emitting it.
+    let min_chunk_samples = (4.0_f32 * CTC_SAMPLE_RATE as f32) as usize;
 
     let mut chunks: Vec<(usize, usize)> = Vec::new();
     let mut in_speech = false;
     let mut speech_start: Option<usize> = None;
+    // If the previous speech run ended shorter than `min_chunk_samples`,
+    // remember its start so the next speech run continues the same chunk
+    // rather than starting a fresh one. Flushed at emit time.
+    let mut pending_start: Option<usize> = None;
 
     for (frame_idx, frame) in audio.chunks(frame_size).enumerate() {
         if frame.len() < frame_size {
@@ -115,7 +128,8 @@ fn transcribe_cpp_with_chunking(
         if is_speech {
             if !in_speech {
                 in_speech = true;
-                speech_start = Some(sample_pos);
+                // Continue a pending short chunk if any, else start fresh.
+                speech_start = pending_start.take().or(Some(sample_pos));
             }
             let speech_len = sample_pos + frame_size - speech_start.unwrap();
             if speech_len >= max_chunk_samples {
@@ -129,13 +143,26 @@ fn transcribe_cpp_with_chunking(
                         .unwrap_or(chunk_end);
                 chunks.push((speech_start.unwrap(), split_at));
                 speech_start = Some(split_at);
+                pending_start = None;
             }
         } else if in_speech {
-            chunks.push((speech_start.unwrap(), sample_pos));
+            let chunk_start = speech_start.unwrap();
+            let chunk_end = sample_pos;
+            if chunk_end - chunk_start >= min_chunk_samples {
+                chunks.push((chunk_start, chunk_end));
+                pending_start = None;
+            } else {
+                // Too short — carry forward into the next speech run.
+                pending_start = Some(chunk_start);
+            }
             in_speech = false;
             speech_start = None;
         }
     }
+    // Flush whatever's in flight. If we ended mid-speech, emit the active
+    // run regardless of length (audio is over). If we ended in silence with
+    // a pending short carry-forward, drop it — emitting a sub-`min_chunk_samples`
+    // final fragment at EOS is no better than skipping it.
     if in_speech {
         if let Some(start) = speech_start {
             chunks.push((start, audio.len()));
