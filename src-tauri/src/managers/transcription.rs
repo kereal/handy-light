@@ -81,6 +81,19 @@ fn transcribe_cpp_with_chunking(
         audio_secs, max_audio_secs
     );
 
+    // Use 60% of the model's advertised max window as the actual chunk cap.
+    // The library's max_audio_ms is the *hard* limit (anything larger degrades
+    // sharply — see GigaAM 25s benchmarks), but pushing right up to it leaves
+    // no headroom for the model to align long-range context. Empirically a
+    // chunk near the limit produces worse output than a smaller one: 20-24s
+    // GigaAM chunks yielded gibberish like "таное" / "вообще машнаое" where
+    // 12-15s chunks on the same audio gave clean phrases. 60% is a safe,
+    // model-agnostic default; if the resulting cap is below `MIN_CHUNK_SECS`
+    // (e.g. some arch advertises a 6s window), fall back to MIN_CHUNK_SECS so
+    // chunking still produces something usable.
+    const SAFE_CHUNK_RATIO: f32 = 0.6;
+    const MIN_CHUNK_SECS: f32 = 4.0;
+    let chunk_cap_secs = (max_audio_secs * SAFE_CHUNK_RATIO).max(MIN_CHUNK_SECS);
     if audio_secs <= max_audio_secs {
         debug!("transcribe-cpp: within max window, single run");
         let result = session
@@ -100,13 +113,13 @@ fn transcribe_cpp_with_chunking(
     let mut vad = transcribe_rs::vad::SmoothedVad::new(Box::new(silero), 15, 30, 2);
     let frame_size = vad.frame_size();
 
-    let max_chunk_samples = (max_audio_secs * CTC_SAMPLE_RATE as f32) as usize;
+    let max_chunk_samples = (chunk_cap_secs * CTC_SAMPLE_RATE as f32) as usize;
     let smart_search_samples = (3.0_f32 * CTC_SAMPLE_RATE as f32) as usize;
     // Chunks shorter than this are too short for GigaAM to produce meaningful
     // output (it expects full words; a 0.5 s chunk is usually a single syllable
     // and yields garbage). When a speech run ends shorter than this, we carry
     // it forward and merge with the next speech run instead of emitting it.
-    let min_chunk_samples = (4.0_f32 * CTC_SAMPLE_RATE as f32) as usize;
+    let min_chunk_samples = (MIN_CHUNK_SECS * CTC_SAMPLE_RATE as f32) as usize;
 
     let mut chunks: Vec<(usize, usize)> = Vec::new();
     let mut in_speech = false;
@@ -174,12 +187,12 @@ fn transcribe_cpp_with_chunking(
     }
 
     info!(
-        "transcribe-cpp: {:.1}s audio → {} VAD chunks (max {:.1}s each)",
+        "transcribe-cpp: {:.1}s audio → {} VAD chunks (cap {:.1}s, model max {:.1}s)",
         audio_secs,
         chunks.len(),
+        chunk_cap_secs,
         max_audio_secs
     );
-
     let mut merged = String::new();
     let mut detected_language: Option<String> = None;
     for (i, (start, end)) in chunks.iter().enumerate() {
