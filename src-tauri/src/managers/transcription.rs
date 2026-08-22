@@ -23,8 +23,8 @@ use transcribe_cpp::{
     Backend, Feature, Model, ModelOptions, RunExtension, RunOptions, Session, StreamOptions, Task,
     WhisperRunOptions,
 };
-use transcribe_rs::transcriber::{Transcriber, VadChunked, VadChunkedConfig};
 use transcribe_rs::vad::{SileroVad, Vad};
+
 use transcribe_rs::{
     onnx::{
         canary::CanaryModel,
@@ -40,21 +40,6 @@ use transcribe_rs::{
 
 const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum audio duration to feed GigaAM v3 in a single forward pass. Above
-/// this the model degrades sharply (WER ~90%+ on 2-min clips) and crashes past
-/// ~200s. Long audio is split at speech/silence boundaries via Silero VAD so
-/// each chunk is a natural phrase instead of a mid-word cut.
-const GIGAAM_MAX_CHUNK_SECS: f32 = 24.0;
-/// When a single speech segment exceeds [`GIGAAM_MAX_CHUNK_SECS`] (long
-/// monologue with no silence), scan this many seconds backward from the limit
-/// for the lowest-energy frame and split there instead of hard-cutting.
-/// Avoids emitting gibberish when the speaker doesn't pause for ~25s.
-const GIGAAM_SMART_SPLIT_SEARCH_SECS: f32 = 3.0;
-/// Sample rate GigaAM expects; matches the recorder output and the headless WAV
-/// loader.
-const CTC_SAMPLE_RATE: u32 = 16_000;
-
 /// Resolve the bundled Silero VAD model path. The same ONNX file ships with
 /// Handy and is also loaded by the audio recorder via `AudioManager`.
 fn silero_vad_model_path(app_handle: &AppHandle) -> Result<std::path::PathBuf> {
@@ -111,12 +96,6 @@ fn transcribe_cpp_with_chunking(
     let mut vad = transcribe_rs::vad::SmoothedVad::new(Box::new(silero), 15, 15, 2);
     let frame_size = vad.frame_size();
 
-    // Walk the audio in 30 ms frames, building (start_sample, end_sample)
-    // ranges that cover continuous speech (after onset/hangover). When a
-    // speech range crosses `max_chunk_samples`, force-split at the
-    // lowest-energy frame in the last 3 s of the range — same smart-split
-    // idea as `VadChunked`, applied manually here so we don't have to
-    // adapt `transcribe-cpp::Session` to the `SpeechModel` trait.
     let max_chunk_samples = (max_audio_secs * CTC_SAMPLE_RATE as f32) as usize;
     let smart_search_samples = (3.0_f32 * CTC_SAMPLE_RATE as f32) as usize;
 
@@ -140,9 +119,6 @@ fn transcribe_cpp_with_chunking(
             }
             let speech_len = sample_pos + frame_size - speech_start.unwrap();
             if speech_len >= max_chunk_samples {
-                // Force-split: find the lowest-energy frame in the last 3 s
-                // and split there. The first half is emitted as a chunk; the
-                // second half becomes the start of the next chunk.
                 let chunk_end = sample_pos + frame_size;
                 let search_start = chunk_end
                     .saturating_sub(smart_search_samples)
@@ -155,13 +131,11 @@ fn transcribe_cpp_with_chunking(
                 speech_start = Some(split_at);
             }
         } else if in_speech {
-            // Speech ended — emit whatever we accumulated.
             chunks.push((speech_start.unwrap(), sample_pos));
             in_speech = false;
             speech_start = None;
         }
     }
-    // Flush any trailing speech.
     if in_speech {
         if let Some(start) = speech_start {
             chunks.push((start, audio.len()));
@@ -169,8 +143,6 @@ fn transcribe_cpp_with_chunking(
     }
 
     if chunks.is_empty() {
-        // No speech detected — return an empty transcript. This avoids
-        // forwarding pure silence/noise to the model.
         return Ok((String::new(), None));
     }
 
@@ -181,7 +153,6 @@ fn transcribe_cpp_with_chunking(
         max_audio_secs
     );
 
-    // Run each chunk and concatenate results.
     let mut merged = String::new();
     let mut detected_language: Option<String> = None;
     for (i, (start, end)) in chunks.iter().enumerate() {
@@ -244,95 +215,11 @@ fn find_lowest_energy_split(samples: &[f32], frame_size: usize) -> Option<usize>
     }
     Some(best_offset)
 }
-/// Transcribe long audio with GigaAM v3 by splitting it at VAD-detected
-/// silences. Short audio (≤ ~24s) is sent through in a single pass — VAD
-/// simply emits one chunk that spans the whole buffer.
-///
-/// Fixed-length chunking at, e.g., 30s boundaries cuts words mid-utterance:
-/// GigaAM then sees half-pronounced tokens at the boundary frame and emits
-/// gibberish (a single trailing line of garbage on a 2-3 min clip). VAD-driven
-/// chunking respects natural phrase boundaries — see thriw's WER benchmark at
-/// https://gist.github.com/thriw/24dc2059790532b7fddd7421d89fc58a
-/// (WER 89-100% → 19-33% on Russian clips of 2-10 minutes).
-///
-/// GigaAM returns text without per-word timestamps, so any overlapping audio
-/// between chunks would be transcribed twice. `VadChunked` produces
-/// back-to-back segments separated by the silence gaps VAD already detected.
-fn transcribe_gigaam_chunked(
-    app_handle: &AppHandle,
-    engine: &mut GigaAMModel,
-    audio: &[f32],
-    options: &TranscribeOptions,
-) -> Result<String> {
-    let audio_secs = audio.len() as f32 / CTC_SAMPLE_RATE as f32;
-    debug!(
-        "GigaAM: {:.1}s @ {}Hz received",
-        audio_secs, CTC_SAMPLE_RATE
-    );
 
-    // Short-path bypass: GigaAM handles ≤24s audio correctly in one shot
-    // (thriw's WER benchmark: 30s whole → 18-25% on Russian). Skipping VAD
-    // for short clips avoids any chance of a mid-syllable boundary cut and
-    // keeps the common voice-command path at one forward pass.
-    if audio_secs <= GIGAAM_MAX_CHUNK_SECS {
-        debug!(
-            "GigaAM: {:.1}s ≤ {:.0}s, single forward pass",
-            audio_secs, GIGAAM_MAX_CHUNK_SECS
-        );
-        let text = engine
-            .transcribe(audio, options)
-            .map(|r| r.text)
-            .map_err(|e| anyhow::anyhow!("GigaAM transcription failed: {}", e))?;
-        let text = text.trim().to_string();
-        info!(
-            "GigaAM single-pass transcription: {:.1}s audio → {} chars",
-            audio_secs,
-            text.chars().count()
-        );
-        return Ok(text);
-    }
-
-    debug!(
-        "GigaAM: {:.1}s > {:.0}s, dispatching through VAD chunker",
-        audio_secs, GIGAAM_MAX_CHUNK_SECS
-    );
-    let vad_path = silero_vad_model_path(app_handle)?;
-    // Wrap raw SileroVad in SmoothedVad so brief dips in speech probability
-    // (syllable closures, breath, plosives) don't trigger a chunk split. With
-    // raw SileroVad, every ~30ms silence within speech closes the chunk and
-    // hands the model a mid-syllable cut, producing garbled text on 1-3 min
-    // recordings. 15 frames of prefill / hangover / 2 frames of onset matches
-    // Handy's offline VAD pipeline (audio_toolkit::vad::SmoothedVad defaults)
-    // and the thriw benchmark at
-    // https://gist.github.com/thriw/24dc2059790532b7fddd7421d89fc58a
-    // (WER 89-100% → 19-33% on 2-10 min Russian clips).
-    let silero = SileroVad::new(&vad_path, 0.3)
-        .map_err(|e| anyhow::anyhow!("Failed to load Silero VAD from {:?}: {}", vad_path, e))?;
-    let vad = transcribe_rs::vad::SmoothedVad::new(Box::new(silero), 15, 15, 2);
-    let config = VadChunkedConfig {
-        // Carry forward short segments and merge with the next speech region
-        // rather than emitting them. GigaAM produces empty / very-low-quality
-        // output on sub-8s chunks — short utterances (backchannels, brief
-        // interjections) are much more useful when joined with the surrounding
-        // sentence. Matches thriw's recommended setting.
-        min_chunk_secs: 8.0,
-        max_chunk_secs: GIGAAM_MAX_CHUNK_SECS,
-        padding_secs: 0.0,
-        smart_split_search_secs: Some(GIGAAM_SMART_SPLIT_SEARCH_SECS),
-        merge_separator: " ".into(),
-    };
-    let mut chunker = VadChunked::new(Box::new(vad), config, options.clone());
-    let result = chunker
-        .transcribe(engine, audio)
-        .map_err(|e| anyhow::anyhow!("GigaAM chunked transcription failed: {}", e))?;
-    let text = result.text.trim().to_string();
-    info!(
-        "GigaAM transcription complete: {:.1}s audio → {} chars",
-        audio_secs,
-        text.chars().count()
-    );
-    Ok(text)
-}
+/// Sample rate GigaAM expects; matches the recorder output and the headless WAV
+/// loader. Also used as the universal 16 kHz assumption when chunking audio for
+/// transcribe-cpp models (all current GGUF architectures expect 16 kHz mono f32).
+const CTC_SAMPLE_RATE: u32 = 16_000;
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -1676,12 +1563,10 @@ impl TranscriptionManager {
                             .map(|r| r.text)
                             .map_err(|e| anyhow::anyhow!("SenseVoice transcription failed: {}", e))
                     }
-                    LoadedEngine::GigaAM(gigaam_engine) => transcribe_gigaam_chunked(
-                        &self.app_handle,
-                        gigaam_engine,
-                        &audio,
-                        &TranscribeOptions::default(),
-                    ),
+                    LoadedEngine::GigaAM(gigaam_engine) => gigaam_engine
+                        .transcribe(&audio, &TranscribeOptions::default())
+                        .map(|r| r.text)
+                        .map_err(|e| anyhow::anyhow!("GigaAM transcription failed: {}", e)),
                     LoadedEngine::Canary(canary_engine) => {
                         output_was_translated = settings.translate_to_english;
                         let lang = if validated_language == "auto" {
