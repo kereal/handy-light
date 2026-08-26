@@ -783,6 +783,7 @@ pub fn run(cli_args: CliArgs) {
             commands::transcription::unload_model_manually,
             commands::transcription::change_transcription_backend_setting,
             commands::transcription::change_websocket_proxy_url_setting,
+            commands::transcription::set_websocket_proxy_token_setting,
             commands::history::get_history_entries,
             commands::history::toggle_history_entry_saved,
             commands::history::get_audio_file_path,

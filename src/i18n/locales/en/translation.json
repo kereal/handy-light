@@ -390,7 +390,10 @@
         "websocketProxy": "WebSocket proxy"
       },
       "urlTitle": "WebSocket URL",
-      "urlDescription": "Address of your WebSocket proxy server (ws:// or wss://). For token-protected servers, configure the bearer token in the Advanced settings (the proxy key is shared with the app's secret store)."
+      "urlDescription": "Address of your WebSocket proxy server (ws:// or wss://). Leave the bearer token field empty to send no Authorization header.",
+      "tokenTitle": "Bearer token",
+      "tokenDescription": "Optional. Sent as `Authorization: Bearer <token>` to the WebSocket server on every request. Stored in the app's local secret store; never written to logs. Leave empty to disable.",
+      "tokenPlaceholder": "Optional secret"
     },
     "postProcessing": {
       "hotkey": {

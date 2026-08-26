@@ -848,6 +848,14 @@ async changeWebsocketProxyUrlSetting(url: string) : Promise<Result<null, string>
     else return { status: "error", error: e  as any };
 }
 },
+async setWebsocketProxyTokenSetting(token: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_websocket_proxy_token_setting", { token }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getHistoryEntries(cursor: number | null, limit: number | null) : Promise<Result<PaginatedHistory, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_history_entries", { cursor, limit }) };
