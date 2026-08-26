@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "handy"
-version = "0.9.6-kereal.1"
+version = "0.9.6+kereal.1"
 dependencies = [
  "anyhow",
  "chrono",
