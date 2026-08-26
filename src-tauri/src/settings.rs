@@ -279,7 +279,6 @@ pub enum TypingTool {
     Ydotool,
     Xdotool,
 }
-
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscribeAcceleratorSetting {
@@ -288,7 +287,6 @@ pub enum TranscribeAcceleratorSetting {
     Cpu,
     Gpu,
 }
-
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OrtAcceleratorSetting {
@@ -296,11 +294,39 @@ pub enum OrtAcceleratorSetting {
     Auto,
     Cpu,
     Cuda,
-    #[serde(rename = "directml")]
     DirectMl,
     Rocm,
 }
 
+/// `Local` runs the same on-device ASR pipeline Handy already ships (Whisper /
+/// Parakeet / Moonshine / etc., selected through `selected_model`). The model
+/// is loaded into `TranscriptionManager` on `start` and unloaded on idle.
+///
+/// `WebSocketProxy` skips the local ASR stack entirely: audio is forwarded as
+/// PCM Float32 LE / 16 kHz / mono frames to a user-configured WebSocket server
+/// (see [`AppSettings::websocket_proxy_url`]) and the server returns the final
+/// text. No local model is loaded, and post-processing is not invoked on the
+/// result — the server is expected to return already-finalized text.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionBackend {
+    Local,
+    WebSocketProxy,
+}
+
+impl Default for TranscriptionBackend {
+    fn default() -> Self {
+        TranscriptionBackend::Local
+    }
+}
+
+fn default_transcription_backend() -> TranscriptionBackend {
+    TranscriptionBackend::Local
+}
+
+fn default_websocket_proxy_url() -> String {
+    String::new()
+}
 #[derive(Clone, Serialize, Deserialize, Type)]
 #[serde(transparent)]
 pub(crate) struct SecretMap(HashMap<String, String>);
@@ -473,6 +499,14 @@ pub struct AppSettings {
     /// Which recording overlay to show: None / Minimal / Live. Streaming mode is
     /// not gated on this — that follows model capability. Migrated from the old
     /// `overlay_position` (position `none` → style `None`).
+    #[serde(default = "default_transcription_backend")]
+    pub transcription_backend: TranscriptionBackend,
+    /// WebSocket endpoint the proxy backend dials when
+    /// [`TranscriptionBackend::WebSocketProxy`] is selected. `ws://` or `wss://`
+    /// URL pointing at a server speaking the ligsai-style protocol (PCM Float32
+    /// LE / 16 kHz / mono frames; `{"cmd":"flush"}` to finalize).
+    #[serde(default = "default_websocket_proxy_url")]
+    pub websocket_proxy_url: String,
     #[serde(default = "default_overlay_style")]
     pub overlay_style: OverlayStyle,
 }
@@ -901,6 +935,8 @@ pub fn get_default_settings() -> AppSettings {
         show_tray_icon: default_show_tray_icon(),
         paste_delay_ms: default_paste_delay_ms(),
         paste_delay_after_ms: default_paste_delay_after_ms(),
+        transcription_backend: default_transcription_backend(),
+        websocket_proxy_url: default_websocket_proxy_url(),
         reliable_paste: false,
         typing_tool: default_typing_tool(),
         external_script_path: None,

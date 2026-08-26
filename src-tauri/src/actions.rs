@@ -7,7 +7,10 @@ use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
-use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
+use crate::managers::ws_transcription;
+use crate::settings::{
+    get_settings, AppSettings, OverlayStyle, TranscriptionBackend, APPLE_INTELLIGENCE_PROVIDER_ID,
+};
 use crate::shortcut;
 use crate::tray::{change_tray_icon, TrayIconState};
 use crate::utils::{
@@ -474,11 +477,65 @@ impl ShortcutAction for TranscribeAction {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
-        // Load model in the background
         let tm = app.state::<Arc<TranscriptionManager>>();
         let rm = app.state::<Arc<AudioRecordingManager>>();
+        let backend = get_settings(app).transcription_backend;
 
-        // Load ASR model and VAD model in parallel
+        // WebSocket-proxy backend: no local model, no VAD pre-load. We still
+        // open the microphone stream and feed frames, but the audio is sent
+        // to a remote server at finalize time.
+        if matches!(backend, TranscriptionBackend::WebSocketProxy) {
+            change_tray_icon(app, TrayIconState::Recording);
+            let binding_id = binding_id.to_string();
+            let mut recording_error: Option<String> = None;
+            match rm.try_start_recording(&binding_id, VadPolicy::Disabled) {
+                Ok(readiness) => {
+                    let generation = readiness.generation();
+                    let app_clone = app.clone();
+                    let rm_clone = Arc::clone(&rm);
+                    std::thread::spawn(move || {
+                        if !readiness.wait() {
+                            return;
+                        }
+                        if rm_clone.is_recording_readiness_current(generation) {
+                            utils::emit_recording_ready(&app_clone);
+                            play_feedback_sound_blocking(&app_clone, SoundType::Start);
+                            rm_clone.apply_mute();
+                        }
+                    });
+                }
+                Err(e) => {
+                    recording_error = Some(e);
+                }
+            }
+            if recording_error.is_some() {
+                utils::hide_recording_overlay(app);
+                change_tray_icon(app, TrayIconState::Idle);
+                if let Some(err) = recording_error {
+                    let error_type = if is_microphone_access_denied(&err) {
+                        "microphone_permission_denied"
+                    } else if is_no_input_device_error(&err) {
+                        "no_input_device"
+                    } else {
+                        "unknown"
+                    };
+                    let _ = app.emit(
+                        "recording-error",
+                        RecordingErrorEvent {
+                            error_type: error_type.to_string(),
+                            detail: Some(err),
+                        },
+                    );
+                }
+            }
+            debug!(
+                "TranscribeAction::start (ws-proxy) completed in {:?}",
+                start_time.elapsed()
+            );
+            return;
+        }
+
+        // Local backend: existing flow — kick off model load + VAD pre-load.
         let kickoff_started = Instant::now();
         tm.initiate_model_load();
         let rm_clone = Arc::clone(&rm);
@@ -489,12 +546,11 @@ impl ShortcutAction for TranscribeAction {
         });
         let kickoff_elapsed = kickoff_started.elapsed();
 
-        let binding_id = binding_id.to_string();
+        let binding_id_local = binding_id.to_string();
         let tray_started = Instant::now();
         change_tray_icon(app, TrayIconState::Recording);
         let tray_elapsed = tray_started.elapsed();
 
-        // Get the microphone mode to determine audio feedback timing
         let plan_started = Instant::now();
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
@@ -503,9 +559,6 @@ impl ShortcutAction for TranscribeAction {
             .state::<Arc<ModelManager>>()
             .get_model_info(&settings.selected_model);
 
-        // Use the app-facing model capability as the single pre-recording source
-        // for live streaming decisions. Unknown support is represented as false
-        // until the model registry is updated by discovery or runtime load.
         let model_supports_streaming = selected_model_info
             .as_ref()
             .map(|m| m.supports_streaming)
@@ -524,7 +577,6 @@ impl ShortcutAction for TranscribeAction {
 
         // Sizing the overlay follows the same advertised capability. A model that
         // doesn't stream (or whose capability is not known yet) gets the compact
-        // pill instead of an oversized transparent live window.
         let overlay_started = Instant::now();
         match settings.overlay_style {
             OverlayStyle::Live if model_supports_streaming => utils::show_streaming_overlay(app),
@@ -544,7 +596,7 @@ impl ShortcutAction for TranscribeAction {
 
         let mut recording_error: Option<String> = None;
         let recording_start_time = Instant::now();
-        match rm.try_start_recording(&binding_id, vad_policy) {
+        match rm.try_start_recording(&binding_id_local, vad_policy) {
             Ok(readiness) => {
                 debug!(
                     "Recording request accepted in {:?}; waiting for first microphone samples",
@@ -715,24 +767,41 @@ impl ShortcutAction for TranscribeAction {
                     let wav_handle = tauri::async_runtime::spawn_blocking(move || {
                         crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
                     });
-
-                    // Transcribe concurrently with WAV save. If a live stream was
-                    // running, finalize it and use its text (all audio was already
-                    // fed to the stream); otherwise batch-transcribe the samples.
+                    // Decide which transcription engine handles the samples.
+                    // WebSocket-proxy bypasses the local stack entirely.
+                    let backend = get_settings(&ah).transcription_backend;
                     let transcription_time = Instant::now();
-                    let transcription_result = match tm.finalize_stream() {
-                        // A finalized stream with usable text wins. An empty result
-                        // (no active stream, produced nothing, or a finalize error
-                        // after the engine was returned) falls back to a full batch
-                        // transcription of the same audio. A finalize timeout is
-                        // surfaced instead — the worker may still hold the engine,
-                        // so a batch fallback would contend with it.
-                        Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
-                        Ok(_) => tm.transcribe(samples),
-                        Err(err) => Err(err),
+                    let transcription_result: Result<String, String> = if matches!(
+                        backend,
+                        TranscriptionBackend::WebSocketProxy
+                    ) {
+                        let url = get_settings(&ah).websocket_proxy_url;
+                        if url.trim().is_empty() {
+                            Err("WebSocket proxy URL is not configured. Set it in Settings → General.".to_string())
+                        } else {
+                            let token = get_settings(&ah)
+                                .post_process_api_keys
+                                .get("websocket_proxy")
+                                .cloned()
+                                .filter(|s| !s.is_empty());
+                            match ws_transcription::transcribe_over_websocket(
+                                &url,
+                                token.as_deref(),
+                                &samples,
+                            )
+                            .await
+                            {
+                                Ok(text) => Ok(text),
+                                Err(e) => Err(format!("{e:#}")),
+                            }
+                        }
+                    } else {
+                        match tm.finalize_stream() {
+                            Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
+                            Ok(_) => tm.transcribe(samples).map_err(|err| format!("{err}")),
+                            Err(err) => Err(format!("{err}")),
+                        }
                     };
-
-                    // Await WAV save and verify
                     let wav_saved = match wav_handle.await {
                         Ok(Ok(())) => {
                             match crate::audio_toolkit::verify_wav_file(

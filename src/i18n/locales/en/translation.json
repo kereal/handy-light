@@ -382,6 +382,16 @@
         "description": "Removes common hesitation words from transcriptions. Turn off to keep them."
       }
     },
+    "transcriptionBackend": {
+      "title": "Transcription Backend",
+      "description": "Choose how Handy turns your speech into text. Use the local on-device model, or forward audio to a remote WebSocket server (no local model is loaded, post-processing is not applied).",
+      "options": {
+        "local": "Local model",
+        "websocketProxy": "WebSocket proxy"
+      },
+      "urlTitle": "WebSocket URL",
+      "urlDescription": "Address of your WebSocket proxy server (ws:// or wss://). For token-protected servers, configure the bearer token in the Advanced settings (the proxy key is shared with the app's secret store)."
+    },
     "postProcessing": {
       "hotkey": {
         "title": "Hotkey"

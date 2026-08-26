@@ -38,3 +38,25 @@ pub fn unload_model_manually(
         .unload_model()
         .map_err(|e| format!("Failed to unload model: {}", e))
 }
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_transcription_backend_setting(app: AppHandle, backend: String) -> Result<(), String> {
+    let parsed = match backend.as_str() {
+        "local" => crate::settings::TranscriptionBackend::Local,
+        "websocket_proxy" => crate::settings::TranscriptionBackend::WebSocketProxy,
+        other => return Err(format!("Unknown transcription backend: {other}")),
+    };
+    let mut settings = get_settings(&app);
+    settings.transcription_backend = parsed;
+    write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_websocket_proxy_url_setting(app: AppHandle, url: String) {
+    let mut settings = get_settings(&app);
+    settings.websocket_proxy_url = url;
+    write_settings(&app, settings);
+}

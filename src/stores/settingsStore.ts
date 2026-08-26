@@ -176,7 +176,11 @@ const settingUpdaters: {
     commands.changeTranscribeGpuDevice(value as number),
   extra_recording_buffer_ms: (value) =>
     commands.changeExtraRecordingBufferSetting(value as number),
-};
+  transcription_backend: (value) =>
+    commands.changeTranscriptionBackendSetting(value as string),
+  websocket_proxy_url: (value) =>
+    commands.changeWebsocketProxyUrlSetting(value as string),
+ };
 
 export const useSettingsStore = create<SettingsStore>()(
   subscribeWithSelector((set, get) => ({
