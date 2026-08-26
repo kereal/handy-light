@@ -281,6 +281,13 @@ function(ggml_add_backend_library backend)
     endif()
 
     target_link_libraries(${backend} PRIVATE ggml-base)
+    target_include_directories(${backend} PRIVATE ..)
+
+    if (${BUILD_SHARED_LIBS})
+        target_compile_definitions(${backend} PRIVATE GGML_BACKEND_BUILD)
+        target_compile_definitions(${backend} PUBLIC  GGML_BACKEND_SHARED)
+    endif()
+    target_link_libraries(${backend} PRIVATE ggml-base)
     if (WIN32)
         # kereal mod: ggml-cpu.cpp uses RegOpenKeyExA/RegQueryValueExA/RegCloseKey
         # for CPU brand detection on Windows. transcribe-cpp-sys 0.2.2 dropped
@@ -289,12 +296,6 @@ function(ggml_add_backend_library backend)
         target_link_libraries(${backend} PRIVATE advapi32)
     endif()
     target_include_directories(${backend} PRIVATE ..)
-
-    if (${BUILD_SHARED_LIBS})
-        target_compile_definitions(${backend} PRIVATE GGML_BACKEND_BUILD)
-        target_compile_definitions(${backend} PUBLIC  GGML_BACKEND_SHARED)
-    endif()
-
     # Set versioning properties for all backend libraries
     # Building a MODULE library with a version is not supported on macOS (https://gitlab.kitware.com/cmake/cmake/-/issues/20782)
     if (NOT (APPLE AND GGML_BACKEND_DL))
@@ -437,7 +438,7 @@ if (GGML_CPU_ALL_VARIANTS)
             message(FATAL_ERROR "Unsupported ARM target OS: ${CMAKE_SYSTEM_NAME}")
         endif()
     elseif (GGML_SYSTEM_ARCH STREQUAL "PowerPC")
-        if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+        if (CMAKE_SYSTEM_NAME MATCHES "Linux|AIX")
             ggml_add_cpu_backend_variant(power0)
             ggml_add_cpu_backend_variant(power7_1       POWER7)
             ggml_add_cpu_backend_variant(power7_2       POWER7  VSX)
@@ -480,6 +481,7 @@ endif()
 ggml_add_backend(BLAS)
 ggml_add_backend(CANN)
 ggml_add_backend(CUDA)
+ggml_add_backend(ET)
 ggml_add_backend(HIP)
 ggml_add_backend(METAL)
 ggml_add_backend(MUSA)
@@ -507,16 +509,17 @@ elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
     target_link_libraries(ggml-base PRIVATE m)
 endif()
 
-if (WIN32)
-    # kereal mod: ggml-cpu.cpp uses RegOpenKeyExA/RegQueryValueExA/RegCloseKey
-    # for CPU brand detection on Windows. transcribe-cpp-sys 0.2.2 dropped the
-    # link against Advapi32, so lld-link fails with undefined symbols when
-    # building ggml-cpu-*.dll backends.
-    target_link_libraries(ggml-base PRIVATE advapi32)
-endif()
-
 if (CMAKE_SYSTEM_NAME MATCHES "Android")
     target_link_libraries(ggml-base PRIVATE dl)
+endif()
+
+if (WIN32)
+    # kereal mod: ggml-cpu.cpp also pokes Windows Registry directly when
+    # linked statically (the static path doesn't go through the MODULE
+    # machinery above). Advapi32 is the home of RegOpenKeyExA/QueryValueExA
+    # /RegCloseKey. Linking against the OS image lib resolves the
+    # unresolved-symbol error from lld-link.
+    target_link_libraries(ggml-base PRIVATE advapi32)
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
