@@ -6,9 +6,7 @@ use crate::settings;
 use crate::settings::OverlayPosition;
 #[cfg(not(target_os = "windows"))]
 use crate::settings::OverlayStyle;
-#[cfg(not(target_os = "windows"))]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(not(target_os = "windows"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::AppHandle;
