@@ -51,13 +51,15 @@ use crate::settings::{self, OverlayPosition};
 // Base units at 96 DPI; everything on screen is multiplied by the window's
 // current DPI scale (see `dpi_scale`), matching how the WebView overlay
 // sized itself in logical pixels.
-
-const CARD_W: f32 = 200.0;
-const CARD_H: f32 = 40.0;
-const PADDING: f32 = 14.0;
-const DOT_DIAMETER: f32 = 10.0;
-const FONT_H: f32 = 15.0;
-
+//
+// Sized to hug the content: 12px padding + 8px dot + 10px gap + widest label
+// ("Transcribing\u{2026}" at 14pt Segoe UI \u2248 95px) + 12px padding \u2248 137px.
+// 144px leaves a small breathing margin and fits every state.
+const CARD_W: f32 = 144.0;
+const CARD_H: f32 = 34.0;
+const PADDING: f32 = 12.0;
+const DOT_DIAMETER: f32 = 8.0;
+const FONT_H: f32 = 14.0;
 // Offsets from the monitor edge, in 96-DPI units; mirror the Windows values
 // of OVERLAY_TOP_OFFSET / OVERLAY_BOTTOM_OFFSET in overlay.rs.
 const TOP_OFFSET: f32 = 4.0;
