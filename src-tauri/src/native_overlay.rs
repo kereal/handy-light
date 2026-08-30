@@ -34,13 +34,14 @@ use windows::Win32::Graphics::Gdi::{
     FW_NORMAL, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_PEN, OUT_DEFAULT_PRECIS,
     PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetWindowTextW, KillTimer, LoadCursorW, RegisterClassExW, SetTimer, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HTTRANSPARENT,
     HWND_TOPMOST, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -67,9 +68,12 @@ const BOTTOM_OFFSET: f32 = 40.0;
 
 const CLASS_NAME: PCWSTR = w!("HandyNativeOverlay");
 const TIMER_ID: usize = 1;
-// The message pump blocks in GetMessageW; the timer wakes it at this cadence
-// so queued commands (state changes, hide) are drained promptly.
+// Repaint cadence for the breathing dot. ~12 FPS is enough to read as a
+// smooth pulse (the eye fills in motion between frames at this rate when
+// the change is small and smooth) and stays cheap on a topmost tool window.
 const TIMER_INTERVAL_MS: u32 = 80;
+// Period of the dot's breath, in milliseconds.
+const PULSE_PERIOD_MS: u32 = 1600;
 
 // ── Colour helpers ────────────────────────────────────────────────────────
 
@@ -429,6 +433,12 @@ unsafe extern "system" fn overlay_wnd_proc(
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
+        // The breathing timer simply invalidates the window so the dot's
+        // colour redraws at TIMER_INTERVAL_MS cadence.
+        WM_TIMER => {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -448,13 +458,27 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     let len = GetWindowTextW(hwnd, &mut label_buf);
     let mut wide: Vec<u16> = label_buf[..len.max(0) as usize].to_vec();
 
+    // Pulse the dot's brightness, not its alpha. GDI's COLORREF has no
+    // alpha channel, so we animate by scaling the RGB triple by a factor
+    // that oscillates 0.55..1.0. This is a GDI-only effect (no DIB,
+    // no AlphaBlend) and reads as a soft breath rather than a flash.
+    let base_color = if is_recording_label(&wide) {
+        DOT_COLOR_RECORDING
+    } else {
+        DOT_COLOR_BUSY
+    };
+    let now_ms = GetTickCount();
+    let phase = (now_ms % PULSE_PERIOD_MS) as f32 / PULSE_PERIOD_MS as f32;
+    let pulse = 0.5 - 0.5 * (phase * std::f32::consts::TAU).sin();
+    let dim = 0.55 + 0.45 * pulse; // 0.55..1.00
+    let r = ((((base_color.0) & 0xFF) as f32) * dim) as u8;
+    let g = ((((base_color.0 >> 8) & 0xFF) as f32) * dim) as u8;
+    let b = ((((base_color.0 >> 16) & 0xFF) as f32) * dim) as u8;
+    let dot_color = colorref(r, g, b);
+
     let bg_brush = CreateSolidBrush(BG_COLOR);
     let border_pen = CreatePen(PS_SOLID, 1, BORDER_COLOR);
-    let dot_brush = if is_recording_label(&wide) {
-        CreateSolidBrush(DOT_COLOR_RECORDING)
-    } else {
-        CreateSolidBrush(DOT_COLOR_BUSY)
-    };
+    let dot_brush = CreateSolidBrush(dot_color);
 
     // Select objects into the DC (SelectObject returns the previous HGDIOBJ).
     let old_brush: HGDIOBJ = SelectObject(hdc, bg_brush.into());
@@ -473,7 +497,6 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     let _ = Ellipse(hdc, padding, dot_top, padding + dot, dot_top + dot);
     let _ = SelectObject(hdc, old_dot_pen);
     let _ = SelectObject(hdc, old_dot_brush);
-
     // Label text, in the UI face the rest of the pill implies.
     let font = CreateFontW(
         -(FONT_H * scale).round() as i32,
