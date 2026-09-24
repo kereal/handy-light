@@ -63,10 +63,7 @@ pub fn change_websocket_proxy_url_setting(app: AppHandle, url: String) {
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_websocket_proxy_token_setting(
-    app: AppHandle,
-    token: String,
-) -> Result<(), String> {
+pub fn set_websocket_proxy_token_setting(app: AppHandle, token: String) -> Result<(), String> {
     let mut settings = get_settings(&app);
     let trimmed = token.trim().to_string();
     if trimmed.is_empty() {

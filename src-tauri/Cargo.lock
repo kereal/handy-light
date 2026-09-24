@@ -2305,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "handy"
-version = "0.9.6+kereal.1"
+version = "0.9.7+kereal.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2334,6 +2334,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "rodio",
+ "rtrb",
  "rubato",
  "rusqlite",
  "rusqlite_migration",
@@ -2369,6 +2370,7 @@ dependencies = [
  "transcribe-cpp",
  "transcribe-rs",
  "vad-rs",
+ "webview2-com",
  "whatlang",
  "windows 0.61.3",
  "winreg 0.55.0",
@@ -4797,6 +4799,12 @@ dependencies = [
  "num-rational",
  "symphonia",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9278fb35b3e730abe136e9b395b5b81b96d06b9f5478a50f0c8430a2237b22de"
 
 [[package]]
 name = "rubato"
