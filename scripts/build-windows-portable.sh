@@ -39,7 +39,9 @@ rm -rf "$DEST"
 mkdir -p "$DEST"
 
 # Required: handy.exe + handy_app_lib.dll + transcribe.dll + ggml base libs
-for f in handy.exe handy_app_lib.dll transcribe.dll ggml.dll ggml-base.dll; do
+# ggml-vulkan.dll: GPU backend (kereal mod: enabled since the machine got
+# 15 GB of RAM — see BUILD.md and the Cargo.toml comment for the history).
+for f in handy.exe handy_app_lib.dll transcribe.dll ggml.dll ggml-base.dll ggml-vulkan.dll; do
   cp "src-tauri/target/x86_64-pc-windows-msvc/release/$f" "$DEST/"
 done
 

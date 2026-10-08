@@ -174,11 +174,18 @@ CARGO_BUILD_JOBS=2 NUM_JOBS=2 \
   compiles in dev mode and the WebView tries to load `http://localhost:1420`
   (the Vite dev server) instead of the embedded `dist/` assets — the app
   opens but shows "can't load this page" and does nothing.
-- `CARGO_BUILD_JOBS=2 NUM_JOBS=2` caps the build's memory (~3 GB peak). The
-  Vulkan backend is disabled in `Cargo.toml` for Windows x86_64 for the same
-  reason: its shader generator emits a 216 MB `mul_mm.comp.cpp` (4.2M lines)
-  that cannot be compiled within ~6 GB. Re-enable `"vulkan"` in the x86_64
-  `transcribe-cpp` features only when building with ≥16 GB of RAM.
+- `CARGO_BUILD_JOBS=2 NUM_JOBS=2` caps the build's memory (~3 GB peak for the
+  CPU-only build).
+- **Vulkan GPU backend (kereal mod, re-enabled 2026-10):** the machine grew to
+  15 GB of RAM, so the x86_64 Windows build now ships `"vulkan"` (see
+  `Cargo.toml`). The shader generator still emits the ~216 MB
+  `mul_mm.comp.cpp`, so keep the jobs caps — the full vulkan build peaked
+  well under the new budget and took ~26 min. The cached Windows SDK is wired
+  in with:
+  `TRANSCRIBE_CMAKE_ARGS="-DVulkan_INCLUDE_DIR=$HOME/.cache/vulkansdk-win/include -DVulkan_LIBRARY=$HOME/.cache/vulkansdk-win/lib-x64/vulkan-1.lib -DVulkan_GLSLC_EXECUTABLE=/usr/bin/glslc"`.
+  `vulkan-shaders-gen` builds with the host (Linux) compiler, and SPIR-V is
+  compiled by the system `glslc` — no Windows glslc or Wine needed. Drop the
+  `"vulkan"` feature again only if RAM drops back under ~6 GB.
 
 Output: `src-tauri/target/x86_64-pc-windows-msvc/release/handy.exe` with the
 `ggml*.dll` / `transcribe.dll` runtime libraries next to it.

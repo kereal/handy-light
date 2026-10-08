@@ -136,11 +136,13 @@ windows = { version = "0.61.3", features = [
 winreg = "0.55"
 
 # Whisper backend per Windows arch. x86_64 keeps the dynamic-backends posture
-# (loadable per-ISA CPU modules) but is CPU-only for now: ggml-vulkan's shader
-# generator emits a mul_mm.comp.cpp of ~216 MB / 4.2M lines, which cannot be
-# compiled within ~6 GB of RAM (typical WSL small-machine limit) — the clang
-# frontend alone exceeds it. The GPU backend can be re-enabled by adding
-# "vulkan" to the features below when building on a machine with more memory.
+# (loadable per-ISA CPU modules). kereal mod: the "vulkan" GPU feature was
+# disabled for months because the ggml-vulkan shader generator emits a
+# mul_mm.comp.cpp of ~216 MB / 4.2M lines that cannot be compiled within ~6 GB
+# of RAM (typical WSL small-machine limit) — the clang frontend alone exceeds
+# it. The machine now has 15 GB, so the GPU backend is re-enabled. The build
+# needs the cached SDK (see BUILD.md: VULKAN_INCLUDE_DIR / vulkan-1.lib /
+# system glslc) and a jobs cap for the same peak-memory reasons as below.
 #
 # Windows-on-ARM is CPU-only: its Adreno Vulkan drivers are immature, and
 # ggml-vulkan's shader generator (vulkan-shaders-gen) does not build under the
@@ -154,6 +156,7 @@ winreg = "0.55"
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
 transcribe-cpp = { version = "0.3.1", default-features = false, features = [
   "dynamic-backends",
+  "vulkan",
 ] }
 
 [target.'cfg(all(windows, target_arch = "aarch64"))'.dependencies]
