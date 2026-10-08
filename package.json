@@ -1,7 +1,7 @@
 {
   "name": "handy-app",
   "private": true,
-  "version": "0.9.7+kereal.1",
+  "version": "0.9.8+kereal.1",
   "type": "module",
   "scripts": {
     "dev": "vite",

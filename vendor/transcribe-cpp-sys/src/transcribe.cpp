@@ -21,10 +21,12 @@
 #include "transcribe-abi.h"
 #include "transcribe-arch.h"
 #include "transcribe-backend.h"
+#include "transcribe-batch-util.h"
 #include "transcribe-loader.h"
 #include "transcribe-log.h"
 #include "transcribe-model.h"
 #include "transcribe-path.h"
+#include "transcribe-prompting.h"
 #include "transcribe-session.h"
 #include "transcribe-tokenizer.h"
 #include "transcribe/whisper.h"
@@ -43,12 +45,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -155,6 +159,8 @@ extern "C" const char * transcribe_status_string(int status) {
             return "input audio too long for model context";
         case TRANSCRIBE_ERR_OUTPUT_TRUNCATED:
             return "output truncated: decode hit the context/generation cap before end-of-stream";
+        case TRANSCRIBE_ERR_OUTPUT_REPETITION:
+            return "output repetition: decode stopped when the output began repeating itself";
         default:
             return "unknown status";
     }
@@ -230,6 +236,8 @@ extern "C" size_t transcribe_abi_struct_size(transcribe_abi_struct which) {
             return sizeof(struct transcribe_device_info);
         case TRANSCRIBE_ABI_SPEAKER_SEGMENT:
             return sizeof(struct transcribe_speaker_segment);
+        case TRANSCRIBE_ABI_BACKEND_INIT_PARAMS:
+            return sizeof(struct transcribe_backend_init_params);
     }
     return 0;  // unknown id: "cannot verify", never a real size
 }
@@ -266,6 +274,8 @@ extern "C" size_t transcribe_abi_struct_align(transcribe_abi_struct which) {
             return alignof(struct transcribe_device_info);
         case TRANSCRIBE_ABI_SPEAKER_SEGMENT:
             return alignof(struct transcribe_speaker_segment);
+        case TRANSCRIBE_ABI_BACKEND_INIT_PARAMS:
+            return alignof(struct transcribe_backend_init_params);
     }
     return 0;
 }
@@ -297,6 +307,8 @@ int timestamp_rank(transcribe_timestamp_kind k) {
 // rejection differs between the two (run mirrors supports_translate,
 // streaming-begin rejects unconditionally in v1), so each caller
 // applies its own translate check before reaching this helper.
+transcribe_status validate_prompting(const transcribe_model * model, const transcribe_run_params * params);
+
 transcribe_status validate_run_params_common(const transcribe_session * session, const transcribe_run_params * params) {
     // Raw-validate every enum field before its first enum-typed load (see
     // enum_field_raw). Once a field passes here, downstream typed reads —
@@ -304,6 +316,7 @@ transcribe_status validate_run_params_common(const transcribe_session * session,
     switch (enum_field_raw(&params->task)) {
         case TRANSCRIBE_TASK_TRANSCRIBE:
         case TRANSCRIBE_TASK_TRANSLATE:
+        case TRANSCRIBE_TASK_INSTRUCT:
             break;
         default:
             return TRANSCRIBE_ERR_INVALID_ARG;
@@ -393,7 +406,128 @@ transcribe_status validate_run_params_common(const transcribe_session * session,
         !session->model->allows_translation_pair(params->language, params->target_language)) {
         return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
     }
+    return validate_prompting(session->model, params);
+}
+
+// Shape and hard-gate checks for the generic prompting fields, on a
+// normalized view. Soft inputs a model ignores are removed later by
+// prepare_prompting.
+transcribe_status validate_prompting(const transcribe_model * model, const transcribe_run_params * params) {
+    auto reject = [](transcribe_status st, const char * why) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "transcribe_run: %s", why);
+        return st;
+    };
+    if (params->n_vocabulary < 0 || (params->n_vocabulary > 0 && params->vocabulary == nullptr)) {
+        return reject(TRANSCRIBE_ERR_INVALID_ARG, "vocabulary is NULL or n_vocabulary is negative");
+    }
+    for (int32_t i = 0; i < params->n_vocabulary; ++i) {
+        if (params->vocabulary[i] == nullptr) {
+            return reject(TRANSCRIBE_ERR_INVALID_ARG, "vocabulary has a NULL entry");
+        }
+    }
+    const bool has_prefix = transcribe::prompting::has_text(params->prefix);
+    if (params->task == TRANSCRIBE_TASK_INSTRUCT) {
+        if (!transcribe::has_feature(model, TRANSCRIBE_FEATURE_INSTRUCT)) {
+            return reject(TRANSCRIBE_ERR_UNSUPPORTED_TASK,
+                          "this model does not support TRANSCRIBE_TASK_INSTRUCT (TRANSCRIBE_FEATURE_INSTRUCT)");
+        }
+        // Output is free text: no target language and no alignment. A prefix
+        // as answer prefill is untested on every INSTRUCT family.
+        if (!transcribe::prompting::has_text(params->prompt)) {
+            return reject(TRANSCRIBE_ERR_INVALID_ARG, "TRANSCRIBE_TASK_INSTRUCT requires a non-empty prompt");
+        }
+        if (params->target_language != nullptr) {
+            return reject(TRANSCRIBE_ERR_INVALID_ARG, "TRANSCRIBE_TASK_INSTRUCT does not take a target_language");
+        }
+        if (params->timestamps != TRANSCRIBE_TIMESTAMPS_NONE && params->timestamps != TRANSCRIBE_TIMESTAMPS_AUTO) {
+            return reject(TRANSCRIBE_ERR_INVALID_ARG, "TRANSCRIBE_TASK_INSTRUCT supports timestamps NONE or AUTO only");
+        }
+        if (has_prefix) {
+            return reject(TRANSCRIBE_ERR_INVALID_ARG,
+                          "a transcript prefix is not supported with TRANSCRIBE_TASK_INSTRUCT");
+        }
+    }
+    // Ignoring a prefix would make the output repeat the prefix's words and
+    // silently break callers that stitch text together, so it is a hard gate.
+    if (has_prefix && !transcribe::has_feature(model, TRANSCRIBE_FEATURE_TRANSCRIPT_PREFIX)) {
+        return reject(TRANSCRIBE_ERR_INVALID_ARG,
+                      "this model does not support a transcript prefix (TRANSCRIBE_FEATURE_TRANSCRIPT_PREFIX)");
+    }
     return TRANSCRIBE_OK;
+}
+
+// Rejects control-token literals in the prompting text before the result
+// snapshot is cleared. Runs after strip_ignored_prompting, so ignored inputs
+// are not rejected.
+transcribe_status check_prompting_text(const transcribe_model * model, const transcribe_run_params * params) {
+    const transcribe::Tokenizer * tok = model->tokenizer();
+    if (tok == nullptr) {
+        return TRANSCRIBE_OK;
+    }
+    for (int32_t i = 0; i < params->n_vocabulary; ++i) {
+        if (const transcribe_status st =
+                transcribe::prompting::check_plain_text(*tok, params->vocabulary[i], "vocabulary");
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+    }
+    if (params->prompt != nullptr) {
+        if (const transcribe_status st = transcribe::prompting::check_plain_text(*tok, params->prompt, "prompt");
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+    }
+    if (params->prefix != nullptr) {
+        return transcribe::prompting::check_plain_text(*tok, params->prefix, "prefix");
+    }
+    return TRANSCRIBE_OK;
+}
+
+// Full-size copy of a caller's run params: defaults first, then only the
+// prefix the caller's struct_size covers, so every trailing field is
+// readable (NULL/0 for an older caller). struct_size is preserved so
+// has_field() gating still sees the caller's true layout. Idempotent.
+void normalize_run_params(const transcribe_run_params * in, transcribe_run_params * out) {
+    transcribe_run_params_init(out);
+    std::memcpy(out, in, static_cast<size_t>(std::min<uint64_t>(in->struct_size, sizeof(*out))));
+}
+
+// Warn about, then remove, the soft prompting inputs this model ignores, so
+// a family only ever sees inputs it should act on. Idempotent: the batch
+// serial fallback re-enters run_one_inner per utterance.
+void strip_ignored_prompting(const transcribe_model * model, transcribe_run_params * params) {
+    const char * arch_name = (model->arch != nullptr && model->arch->name != nullptr) ? model->arch->name : "(unknown)";
+    const bool   instruct  = params->task == TRANSCRIBE_TASK_INSTRUCT;
+    if (params->n_vocabulary > 0 && !transcribe::has_feature(model, TRANSCRIBE_FEATURE_VOCABULARY)) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                            "transcribe_run: model '%s' does not support vocabulary; ignoring %d term(s). Use "
+                            "transcribe_model_supports(model, TRANSCRIBE_FEATURE_VOCABULARY) to pre-check.",
+                            arch_name, params->n_vocabulary);
+        params->vocabulary   = nullptr;
+        params->n_vocabulary = 0;
+    }
+    if (!instruct && transcribe::prompting::has_text(params->prompt) &&
+        !transcribe::has_feature(model, TRANSCRIBE_FEATURE_CONTEXT_PROMPT)) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                            "transcribe_run: model '%s' has no context-prompt slot; ignoring prompt. Use "
+                            "transcribe_model_supports(model, TRANSCRIBE_FEATURE_CONTEXT_PROMPT) to pre-check, or "
+                            "TRANSCRIBE_TASK_INSTRUCT on models with TRANSCRIBE_FEATURE_INSTRUCT.",
+                            arch_name);
+        params->prompt = nullptr;
+    }
+    if (!transcribe::prompting::has_text(params->prompt)) {
+        params->prompt = nullptr;
+    }
+    if (!transcribe::prompting::has_text(params->prefix)) {
+        params->prefix = nullptr;
+    }
+}
+
+// The pre-clear prompting step every entry point shares, on a validated
+// normalized view.
+transcribe_status prepare_prompting(const transcribe_model * model, transcribe_run_params * params) {
+    strip_ignored_prompting(model, params);
+    return check_prompting_text(model, params);
 }
 
 }  // namespace
@@ -657,6 +791,15 @@ extern "C" void transcribe_device_info_init(struct transcribe_device_info * p) {
     p->struct_size = sizeof(*p);
 }
 
+extern "C" void transcribe_backend_init_params_init(struct transcribe_backend_init_params * p) {
+    if (p == nullptr) {
+        return;
+    }
+    std::memset(p, 0, sizeof(*p));
+    p->struct_size      = sizeof(*p);
+    p->allowed_backends = TRANSCRIBE_BACKEND_MASK_ALL;
+}
+
 extern "C" void transcribe_word_init(struct transcribe_word * p) {
     if (p == nullptr) {
         return;
@@ -763,6 +906,8 @@ constexpr size_t k_min_token_size           = TRANSCRIBE_FIELD_END(transcribe_to
 constexpr size_t k_min_speaker_segment_size = TRANSCRIBE_FIELD_END(transcribe_speaker_segment, p);
 constexpr size_t k_min_timings_size         = TRANSCRIBE_FIELD_END(transcribe_timings, decode_ms);
 constexpr size_t k_min_device_info_size     = TRANSCRIBE_FIELD_END(transcribe_device_info, kind);
+constexpr size_t k_min_backend_init_params_size =
+    TRANSCRIBE_FIELD_END(transcribe_backend_init_params, allowed_backends);
 // k_min_whisper_chunk_trace_size lives in arch/whisper/public.cpp with
 // the chunk-trace accessor that uses it.
 
@@ -878,6 +1023,167 @@ static std::string path_for_c_api(const std::filesystem::path & path) {
 }
 #endif
 
+// Allowed-backend mask, enforced by backend_reg_filter (installed at static
+// init). The first filter call fixes the mask. Mask (low 32 bits) and fixed
+// flag share one atomic so _ex() cannot race the first registration.
+constexpr uint64_t           k_backend_mask_fixed = uint64_t{ 1 } << 32;
+static std::atomic<uint64_t> s_backend_mask_state{ TRANSCRIBE_BACKEND_MASK_ALL };
+
+static uint32_t host_backend_mask() {
+    return static_cast<uint32_t>(s_backend_mask_state.load());
+}
+
+static bool ascii_iequals(const char * a, const char * b) {
+    for (; *a != '\0' && *b != '\0'; ++a, ++b) {
+        if (std::tolower(static_cast<unsigned char>(*a)) != std::tolower(static_cast<unsigned char>(*b))) {
+            return false;
+        }
+    }
+    return *a == *b;
+}
+
+// ascii_iequals for a token that is not NUL-terminated.
+static bool ascii_iequals_n(const char * a, size_t n, const char * b) {
+    for (size_t i = 0; i < n; ++i, ++b) {
+        if (*b == '\0' ||
+            std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(*b))) {
+            return false;
+        }
+    }
+    return *b == '\0';
+}
+
+struct BackendMaskName {
+    const char * name;
+    uint32_t     bit;
+};
+
+// ggml module name -> mask bit; unlisted (incl. "external") is OTHER.
+static uint32_t module_mask_bit(const char * name) {
+    static const BackendMaskName k_modules[] = {
+        { "cpu",    TRANSCRIBE_BACKEND_MASK_CPU    },
+        { "blas",   TRANSCRIBE_BACKEND_MASK_CPU    },
+        { "zendnn", TRANSCRIBE_BACKEND_MASK_CPU    },
+        { "metal",  TRANSCRIBE_BACKEND_MASK_METAL  },
+        { "vulkan", TRANSCRIBE_BACKEND_MASK_VULKAN },
+        { "cuda",   TRANSCRIBE_BACKEND_MASK_CUDA   },
+        { "hip",    TRANSCRIBE_BACKEND_MASK_ROCM   },
+    };
+    for (const auto & e : k_modules) {
+        if (ascii_iequals(name, e.name)) {
+            return e.bit;
+        }
+    }
+    return TRANSCRIBE_BACKEND_MASK_OTHER;
+}
+
+// TRANSCRIBE_BACKENDS, parsed once; unset/empty is ALL. Runs inside the
+// registry filter, so it must not allocate or throw.
+static uint32_t env_backend_mask() {
+    static const uint32_t mask = [] {
+        static const BackendMaskName k_tokens[] = {
+            { "cpu",    TRANSCRIBE_BACKEND_MASK_CPU    },
+            { "metal",  TRANSCRIBE_BACKEND_MASK_METAL  },
+            { "vulkan", TRANSCRIBE_BACKEND_MASK_VULKAN },
+            { "cuda",   TRANSCRIBE_BACKEND_MASK_CUDA   },
+            { "rocm",   TRANSCRIBE_BACKEND_MASK_ROCM   },
+            { "other",  TRANSCRIBE_BACKEND_MASK_OTHER  },
+            { "all",    TRANSCRIBE_BACKEND_MASK_ALL    },
+        };
+        const char * env = std::getenv("TRANSCRIBE_BACKENDS");
+        if (env == nullptr || env[0] == '\0') {
+            return TRANSCRIBE_BACKEND_MASK_ALL;
+        }
+        uint32_t     m       = 0;
+        bool         unknown = false;
+        const char * tok     = env;
+        for (const char * p = env;; ++p) {
+            if (*p != '\0' && *p != ',' && *p != ' ' && *p != '\t') {
+                continue;
+            }
+            const size_t len = static_cast<size_t>(p - tok);
+            if (len > 0) {
+                uint32_t bit = 0;
+                for (const auto & e : k_tokens) {
+                    if (ascii_iequals_n(tok, len, e.name)) {
+                        bit = e.bit;
+                    }
+                }
+                unknown = unknown || bit == 0;
+                m |= bit;
+            }
+            if (*p == '\0') {
+                break;
+            }
+            tok = p + 1;
+        }
+        // Unknown names are dropped, so a typo narrows (fail-closed). Say
+        // loudly what that left allowed.
+        if (unknown) {
+            char           allowed[64] = "all";
+            const uint32_t eff         = m | TRANSCRIBE_BACKEND_MASK_CPU;
+            if (eff != TRANSCRIBE_BACKEND_MASK_ALL) {
+                size_t off = 0;
+                for (const auto & e : k_tokens) {
+                    if (e.bit != TRANSCRIBE_BACKEND_MASK_ALL && (eff & e.bit) != 0) {
+                        off += static_cast<size_t>(
+                            std::snprintf(allowed + off, sizeof(allowed) - off, "%s%s", off ? "," : "", e.name));
+                    }
+                }
+            }
+            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                                "TRANSCRIBE_BACKENDS='%s': unknown backend name(s) ignored; it now allows: %s "
+                                "(valid: cpu, metal, vulkan, cuda, rocm, other, all)",
+                                env, allowed);
+        }
+        return m;
+    }();
+    return mask;
+}
+
+static uint32_t effective_backend_mask(uint32_t host_mask) {
+    return (host_mask & env_backend_mask()) | TRANSCRIBE_BACKEND_MASK_CPU;
+}
+
+// Called from inside ggml's registry: must not touch the registry or throw.
+static bool backend_reg_filter(const char * name) noexcept {
+    const uint32_t host    = static_cast<uint32_t>(s_backend_mask_state.fetch_or(k_backend_mask_fixed));
+    const uint32_t bit     = module_mask_bit(name != nullptr ? name : "");
+    const bool     allowed = (effective_backend_mask(host) & bit) != 0;
+    if (!allowed) {
+        // Callback-only, like the post-scan device summary: no stderr noise.
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "backend '%s' not registered: excluded by allowed-backend mask",
+                      name != nullptr ? name : "(null)");
+        transcribe_log_emit(TRANSCRIBE_LOG_LEVEL_DEBUG, msg);
+    }
+    return allowed;
+}
+
+static const bool s_backend_reg_filter_installed = [] {
+    ggml_backend_set_reg_filter(&backend_reg_filter);
+    return true;
+}();
+
+static transcribe_status set_host_backend_mask(uint32_t mask) {
+    uint64_t state = s_backend_mask_state.load();
+    while ((state & k_backend_mask_fixed) == 0) {
+        if (s_backend_mask_state.compare_exchange_weak(state, mask)) {
+            return TRANSCRIBE_OK;
+        }
+    }
+    const uint32_t current = effective_backend_mask(static_cast<uint32_t>(state));
+    const uint32_t wanted  = effective_backend_mask(mask);
+    if (current != wanted) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                            "transcribe_init_backends_ex: allowed-backend mask is already fixed at 0x%08x "
+                            "(backends were registered earlier in this process); cannot change it to 0x%08x",
+                            current, wanted);
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    return TRANSCRIBE_OK;
+}
+
 static transcribe_status transcribe_init_backends_impl(const char * artifact_dir) {
     ensure_ggml_time_init();
     if (artifact_dir == nullptr || artifact_dir[0] == '\0') {
@@ -958,6 +1264,35 @@ static transcribe_status transcribe_init_backends_default_impl(void) {
     const auto s = path_for_c_api(dir);
     return transcribe_init_backends(s.c_str());
 #endif
+}
+
+static transcribe_status transcribe_init_backends_ex_impl(const struct transcribe_backend_init_params * params) {
+    ensure_ggml_time_init();
+    struct transcribe_backend_init_params p;
+    transcribe_backend_init_params_init(&p);
+    if (params != nullptr) {
+        if (const auto st = check_input_struct_size(params->struct_size, k_min_backend_init_params_size);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        std::memcpy(&p, params, std::min<uint64_t>(params->struct_size, sizeof(p)));
+    }
+    if (const auto st = set_host_backend_mask(p.allowed_backends); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    const auto st = p.artifact_dir != nullptr ? transcribe_init_backends_impl(p.artifact_dir) :
+                                                transcribe_init_backends_default_impl();
+    if (st != TRANSCRIBE_OK) {
+        return st;
+    }
+    // Static builds register lazily; force it so this call fixes the mask.
+    if (ggml_backend_dev_count() == 0) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                            "transcribe_init_backends_ex: no compute devices registered (allowed-backend mask 0x%08x)",
+                            effective_backend_mask(host_backend_mask()));
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    return TRANSCRIBE_OK;
 }
 
 namespace {
@@ -1735,6 +2070,11 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     if (const auto st = check_input_struct_size(run_params->struct_size, k_min_run_params_size); st != TRANSCRIBE_OK) {
         return st;
     }
+    // Full-size view (see normalize_run_params); the family hook gets a
+    // further copy whose strings the library owns, built below.
+    struct transcribe_run_params run_params_view;
+    normalize_run_params(run_params, &run_params_view);
+    run_params = &run_params_view;
     if (const auto st = check_input_struct_size(stream_params->struct_size, k_min_stream_params_size);
         st != TRANSCRIBE_OK) {
         return st;
@@ -1788,8 +2128,16 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     // family that supports streaming translate would loosen this in
     // its stream_begin hook, but the central dispatcher refuses
     // upfront so partially-wired callers fail fast.
-    if (run_params->task == TRANSCRIBE_TASK_TRANSLATE) {
+    if (run_params->task == TRANSCRIBE_TASK_TRANSLATE || run_params->task == TRANSCRIBE_TASK_INSTRUCT) {
         return TRANSCRIBE_ERR_UNSUPPORTED_TASK;
+    }
+    // A prefix is forced decoder text for one utterance's opening; a stream
+    // has no fixed opening to force it onto.
+    if (transcribe::prompting::has_text(run_params->prefix)) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                            "transcribe_stream_begin: a transcript prefix is not accepted "
+                            "for streaming");
+        return TRANSCRIBE_ERR_INVALID_ARG;
     }
 
     if (stream_params->family != nullptr) {
@@ -1807,6 +2155,9 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     // clear_result so the pre-hook "snapshot preserved on rejection"
     // contract is undisturbed.
     warn_unsupported_advisory(session->model, run_params);
+    if (const transcribe_status st = prepare_prompting(session->model, &run_params_view); st != TRANSCRIBE_OK) {
+        return st;
+    }
 
     // Optional family preflight: validates extension field values
     // (e.g. parakeet's (L, C, R) menu) without mutating state. On
@@ -1826,6 +2177,7 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     session->t_decode_us                      = 0;
     session->was_aborted                      = false;
     session->was_truncated                    = false;
+    session->stopped_on_repetition            = false;
     session->stream_state                     = TRANSCRIBE_STREAM_ACTIVE;
     session->stream_commit_policy             = commit_policy;
     session->stream_stable_prefix_agreement_n = stable_prefix_agreement_n;
@@ -1841,21 +2193,27 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     // wants a run-slot ext at stream begin must plumb it deliberately.
     session->stream_language_owned        = run_params->language != nullptr ? run_params->language : "";
     session->stream_target_language_owned = run_params->target_language != nullptr ? run_params->target_language : "";
-    // PREFIX copy, not struct assignment: the size gate above admits any
-    // struct_size >= k_min_run_params_size, so a conforming caller's
-    // allocation may be SHORTER than sizeof (fields past `family`, e.g.
-    // spec_k_drafts, absent). Init first so bytes past the caller's
-    // prefix hold their documented defaults, then copy only what the
-    // caller owns. The caller's struct_size is preserved by the copy, so
-    // downstream has_field() gating still sees the caller's true layout.
-    struct transcribe_run_params run_params_owned;
-    transcribe_run_params_init(&run_params_owned);
-    std::memcpy(&run_params_owned, run_params,
-                static_cast<size_t>(std::min<uint64_t>(run_params->struct_size, sizeof(run_params_owned))));
+    // Copied from the normalized view (never the caller's struct, whose
+    // allocation may end before the trailing fields); the view keeps the
+    // caller's struct_size, so has_field() gating still sees its layout.
+    struct transcribe_run_params run_params_owned = run_params_view;
     run_params_owned.language = run_params->language != nullptr ? session->stream_language_owned.c_str() : nullptr;
     run_params_owned.target_language =
         run_params->target_language != nullptr ? session->stream_target_language_owned.c_str() : nullptr;
-    run_params_owned.family = nullptr;
+    run_params_owned.family          = nullptr;
+    // Generic prompting strings, same ownership rule. Only non-empty terms
+    // are kept, so the view's count matches the owned array.
+    session->stream_vocabulary_owned = transcribe::prompting::terms(run_params);
+    session->stream_vocabulary_ptrs.clear();
+    for (const std::string & term : session->stream_vocabulary_owned) {
+        session->stream_vocabulary_ptrs.push_back(term.c_str());
+    }
+    session->stream_prompt_owned = run_params->prompt != nullptr ? run_params->prompt : "";
+    run_params_owned.vocabulary =
+        session->stream_vocabulary_ptrs.empty() ? nullptr : session->stream_vocabulary_ptrs.data();
+    run_params_owned.n_vocabulary = static_cast<int32_t>(session->stream_vocabulary_ptrs.size());
+    run_params_owned.prompt       = run_params->prompt != nullptr ? session->stream_prompt_owned.c_str() : nullptr;
+    run_params_owned.prefix       = nullptr;
 
     const transcribe_status st = session->model->arch->stream_begin(session, &run_params_owned, stream_params);
     if (st != TRANSCRIBE_OK) {
@@ -2063,16 +2421,40 @@ extern "C" transcribe_status transcribe_stream_get_text(const struct transcribe_
     return TRANSCRIBE_OK;
 }
 
+// Scope guard that calls transcribe_session::release_scratch on exit once
+// armed. Both offline entry points use it so release also happens when a
+// family hook throws and the api_guard unwinds the stack, including the path
+// where memory pressure matters most. release_scratch is noexcept, so running
+// it during unwinding is safe.
+namespace {
+
+struct scratch_release_guard {
+    transcribe_session * session = nullptr;
+    bool                 armed   = false;
+
+    ~scratch_release_guard() {
+        if (armed && session != nullptr) {
+            session->release_scratch();
+        }
+    }
+};
+
+}  // namespace
+
 // Shared one-utterance run body. Does NOT touch session->batch_results, so
 // the batch dispatcher can call it once per utterance inside a loop without
 // erasing already-accumulated entries; the public transcribe_run wrapper
 // below clears batch_results once before delegating here. Every early
 // return preserves the previous result snapshot exactly as the original
 // transcribe_run contract documented (see the inline comments).
+// `committed` (optional) is set true once the call passes the pre-clear
+// gates and commits to replacing the result. The caller uses it to decide
+// whether compute scratch needs releasing.
 static transcribe_status run_one_inner(struct transcribe_session *          session,
                                        const float *                        pcm,
                                        int                                  n_samples,
-                                       const struct transcribe_run_params * params) {
+                                       const struct transcribe_run_params * params,
+                                       bool *                               committed = nullptr) {
     // Parameter-shape validation runs first and does not touch session
     // state. A caller that passes NULL pointers or a non-positive sample
     // count gets ERR_INVALID_ARG back without any visible side effect
@@ -2102,6 +2484,12 @@ static transcribe_status run_one_inner(struct transcribe_session *          sess
     if (const auto st = check_input_struct_size(params->struct_size, k_min_run_params_size); st != TRANSCRIBE_OK) {
         return st;
     }
+    // Everything downstream reads this full-size view, never the caller's
+    // struct: an older caller's allocation may end before the prompting
+    // fields. Strings stay caller-owned; the call is synchronous.
+    struct transcribe_run_params params_view;
+    normalize_run_params(params, &params_view);
+    params = &params_view;
     // A run cannot replace an active stream's results — that would
     // strand the in-flight stream's per-family state. Caller must
     // finalize or reset first. FINISHED and FAILED both fall through;
@@ -2151,6 +2539,9 @@ static transcribe_status run_one_inner(struct transcribe_session *          sess
         if (params->task == TRANSCRIBE_TASK_TRANSLATE && !session->model->caps.supports_translate) {
             return TRANSCRIBE_ERR_UNSUPPORTED_TASK;
         }
+        if (const transcribe_status st = prepare_prompting(session->model, &params_view); st != TRANSCRIBE_OK) {
+            return st;
+        }
 
         // Family run-ext validation (the _RUN analogue of stream_validate),
         // the final pre-clear gate. Runs AFTER the run-param checks above,
@@ -2183,17 +2574,21 @@ static transcribe_status run_one_inner(struct transcribe_session *          sess
     // their own front-matter checks succeed; that call is now
     // redundant but idempotent, and removing it is a refactor
     // deferred to a later pass.
+    if (committed != nullptr) {
+        *committed = true;
+    }
     session->clear_result();
-    session->t_mel_us      = 0;
-    session->t_encode_us   = 0;
-    session->t_decode_us   = 0;
-    session->was_aborted   = false;
-    session->was_truncated = false;
+    session->t_mel_us              = 0;
+    session->t_encode_us           = 0;
+    session->t_decode_us           = 0;
+    session->was_aborted           = false;
+    session->was_truncated         = false;
+    session->stopped_on_repetition = false;
     // Force stream_state to IDLE: clear_result deliberately preserves
     // lifecycle state, but a well-formed transcribe_run subsumes any
     // prior FINISHED/FAILED stream — after a one-shot run the context
     // is no longer meaningfully in a streaming lifecycle.
-    session->stream_state  = TRANSCRIBE_STREAM_IDLE;
+    session->stream_state          = TRANSCRIBE_STREAM_IDLE;
 
     if (session->model == nullptr || session->model->arch == nullptr || session->model->arch->run == nullptr) {
         return TRANSCRIBE_ERR_NOT_IMPLEMENTED;
@@ -2218,7 +2613,12 @@ static transcribe_status transcribe_run_impl(struct transcribe_session *        
     if (session != nullptr && pcm != nullptr && n_samples > 0) {
         session->batch_results.clear();
     }
-    return run_one_inner(session, pcm, n_samples, params);
+    // run_one_inner arms the guard at its commit point, so a pre-clear
+    // rejection never releases and everything after (family error, abort,
+    // throw) always does.
+    scratch_release_guard scratch_release;
+    scratch_release.session = session;
+    return run_one_inner(session, pcm, n_samples, params, &scratch_release.armed);
 }
 
 // Batch run (offline)
@@ -2283,7 +2683,18 @@ static transcribe_status transcribe_run_batch_impl(struct transcribe_session *  
     if (const auto st = check_input_struct_size(params->struct_size, k_min_run_params_size); st != TRANSCRIBE_OK) {
         return st;
     }
+    struct transcribe_run_params params_view;
+    normalize_run_params(params, &params_view);
+    params = &params_view;
     if (session->stream_state == TRANSCRIBE_STREAM_ACTIVE) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    // One shared params across different audio: a transcript prefix can
+    // only describe one of them.
+    if (transcribe::prompting::has_text(params->prefix)) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                            "transcribe_run_batch: a transcript prefix is per-utterance "
+                            "and is not accepted in a batch");
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
 
@@ -2307,6 +2718,9 @@ static transcribe_status transcribe_run_batch_impl(struct transcribe_session *  
         if (params->task == TRANSCRIBE_TASK_TRANSLATE && !session->model->caps.supports_translate) {
             return TRANSCRIBE_ERR_UNSUPPORTED_TASK;
         }
+        if (const transcribe_status st = prepare_prompting(session->model, &params_view); st != TRANSCRIBE_OK) {
+            return st;
+        }
         if (session->model->arch != nullptr && session->model->arch->run_validate != nullptr) {
             if (const transcribe_status st = session->model->arch->run_validate(session, params); st != TRANSCRIBE_OK) {
                 return st;
@@ -2320,13 +2734,21 @@ static transcribe_status transcribe_run_batch_impl(struct transcribe_session *  
 
     // Past this point we commit to producing a fresh batch result.
     session->clear_result();
-    session->t_mel_us      = 0;
-    session->t_encode_us   = 0;
-    session->t_decode_us   = 0;
-    session->was_aborted   = false;
-    session->was_truncated = false;
-    session->stream_state  = TRANSCRIBE_STREAM_IDLE;
+    session->t_mel_us              = 0;
+    session->t_encode_us           = 0;
+    session->t_decode_us           = 0;
+    session->was_aborted           = false;
+    session->was_truncated         = false;
+    session->stopped_on_repetition = false;
+    session->stream_state          = TRANSCRIBE_STREAM_IDLE;
     session->batch_results.clear();
+
+    // Release the compute scratch once the batch has run, whichever path it
+    // took (see transcribe_session::release_scratch). Once per call, not per
+    // utterance, so the serial fallback keeps its workspace across the loop.
+    scratch_release_guard scratch_release;
+    scratch_release.session = session;
+    scratch_release.armed   = true;
 
     // Fast path: a family with a batched compute graph owns the whole loop.
     if (session->model->arch->run_batch != nullptr) {
@@ -2345,36 +2767,11 @@ static transcribe_status transcribe_run_batch_impl(struct transcribe_session *  
 
     // Generic serial fallback: run each utterance in turn and snapshot it.
     // Correct for every family; only the per-dispatch device throughput of
-    // a real run_batch() is forgone.
+    // a real run_batch() is forgone. run_one_inner re-validates the shared
+    // params (idempotent) before the family run().
     session->batch_results.reserve(static_cast<size_t>(n));
-    transcribe_status batch_status = TRANSCRIBE_OK;
-    for (int i = 0; i < n; ++i) {
-        if (session->poll_abort()) {
-            batch_status = TRANSCRIBE_ERR_ABORTED;
-            break;
-        }
-        // run_one_inner clears the scratch slot and writes this utterance's
-        // result; it re-validates the shared params (idempotent) and
-        // validates this utterance's pcm[i] / n_samples[i].
-        const transcribe_status st = run_one_inner(session, pcm[i], n_samples[i], params);
-        if (st == TRANSCRIBE_OK) {
-            // capture_result (not a local field-copy) so every result field —
-            // including per-utterance timings and raw_text — reaches the
-            // batch snapshot without a second list to keep in sync.
-            session->batch_results.push_back(session->capture_result(st));
-        } else {
-            // Malformed-input early returns preserve the previous scratch
-            // slot, so do NOT snapshot it — record an explicit empty
-            // failure for this utterance instead.
-            transcribe_session::ResultSet rs;
-            rs.status = st;
-            session->batch_results.push_back(std::move(rs));
-            if (st == TRANSCRIBE_ERR_ABORTED) {
-                batch_status = TRANSCRIBE_ERR_ABORTED;
-                break;
-            }
-        }
-    }
+    const transcribe_status batch_status = transcribe::run_batch_serial(
+        session, pcm, n_samples, n, [&](const float * p, int ns) { return run_one_inner(session, p, ns, params); });
 
     // On abort the loop can break early, leaving fewer than n entries;
     // synthesize any missing slots so the result-set view always exposes n
@@ -3128,6 +3525,15 @@ extern "C" transcribe_status transcribe_init_backends(const char * artifact_dir)
 extern "C" transcribe_status transcribe_init_backends_default(void) {
     return api_guard_status("transcribe_init_backends_default",
                             [&] { return transcribe_init_backends_default_impl(); });
+}
+
+extern "C" transcribe_status transcribe_init_backends_ex(const struct transcribe_backend_init_params * params) {
+    return api_guard_status("transcribe_init_backends_ex", [&] { return transcribe_init_backends_ex_impl(params); });
+}
+
+extern "C" uint32_t transcribe_allowed_backends(void) {
+    return api_guard_value("transcribe_allowed_backends", static_cast<uint32_t>(TRANSCRIBE_BACKEND_MASK_CPU),
+                           [&] { return effective_backend_mask(host_backend_mask()); });
 }
 
 extern "C" int transcribe_device_count(void) {

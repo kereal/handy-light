@@ -152,8 +152,8 @@
  * exactly and refuses to load a native provider that does not match.
  */
 #define TRANSCRIBE_VERSION_MAJOR 0
-#define TRANSCRIBE_VERSION_MINOR 2
-#define TRANSCRIBE_VERSION_PATCH 2
+#define TRANSCRIBE_VERSION_MINOR 3
+#define TRANSCRIBE_VERSION_PATCH 1
 
 #define TRANSCRIBE_VERSION_STRINGIZE_(x) #x
 #define TRANSCRIBE_VERSION_STRINGIZE(x)  TRANSCRIBE_VERSION_STRINGIZE_(x)
@@ -269,10 +269,11 @@ typedef enum {
     /*
      * Returned by transcribe_run when the decode stopped because it hit
      * the model's context / generation budget BEFORE the model emitted
-     * end-of-stream — i.e. the transcript is incomplete. This is the
-     * "started, couldn't finish" counterpart to INPUT_TOO_LONG, and it is
-     * a hard non-OK status by design: a truncated transcript must not be
-     * mistaken for a complete one.
+     * end-of-stream — i.e. the transcript is incomplete. If the partial
+     * ends in a phrase repeating itself, the repeats are dropped (one
+     * copy kept). This is the "started, couldn't finish" counterpart to
+     * INPUT_TOO_LONG, and it is a hard non-OK status by design: a
+     * truncated transcript must not be mistaken for a complete one.
      *
      * The partial transcript IS preserved and readable through the normal
      * result accessors (transcribe_full_text, segments, words, tokens),
@@ -293,6 +294,25 @@ typedef enum {
      * See docs/input-limits.md for the full contract.
      */
     TRANSCRIBE_ERR_OUTPUT_TRUNCATED       = 18,
+    /*
+     * Returned by transcribe_run when a greedy decode fell into repeating
+     * the same block of tokens over and over and was stopped early,
+     * BEFORE the model emitted end-of-stream. The repeats are dropped
+     * (one copy kept), but whatever the audio said after the loop was
+     * never decoded, so the transcript is incomplete.
+     *
+     * Result-bearing exactly like OUTPUT_TRUNCATED: the partial transcript
+     * is readable through the normal result accessors, and
+     * transcribe_was_truncated() is true. The two codes differ only in why
+     * the decode stopped: the budget ran out (OUTPUT_TRUNCATED) versus the
+     * output started looping (this code). Re-running the same audio gives
+     * the same result; splitting it at a different point may not loop.
+     *
+     * Per-utterance in transcribe_run_batch, like OUTPUT_TRUNCATED. Not
+     * used by streaming. Set TRANSCRIBE_NO_REPETITION_GUARD=1 to disable
+     * the check. See docs/input-limits.md.
+     */
+    TRANSCRIBE_ERR_OUTPUT_REPETITION      = 19,
 } transcribe_status;
 
 /*
@@ -349,21 +369,22 @@ TRANSCRIBE_API const char * transcribe_version_commit(void);
  * is append-only; do not renumber existing values.
  */
 typedef enum {
-    TRANSCRIBE_ABI_MODEL_LOAD_PARAMS = 0,
-    TRANSCRIBE_ABI_SESSION_PARAMS    = 1,
-    TRANSCRIBE_ABI_RUN_PARAMS        = 2,
-    TRANSCRIBE_ABI_STREAM_PARAMS     = 3,
-    TRANSCRIBE_ABI_CAPABILITIES      = 4,
-    TRANSCRIBE_ABI_TIMINGS           = 5,
-    TRANSCRIBE_ABI_SEGMENT           = 6,
-    TRANSCRIBE_ABI_WORD              = 7,
-    TRANSCRIBE_ABI_TOKEN             = 8,
-    TRANSCRIBE_ABI_STREAM_UPDATE     = 9,
-    TRANSCRIBE_ABI_STREAM_TEXT       = 10,
-    TRANSCRIBE_ABI_SESSION_LIMITS    = 11,
-    TRANSCRIBE_ABI_EXT               = 12,
-    TRANSCRIBE_ABI_DEVICE_INFO       = 13,
-    TRANSCRIBE_ABI_SPEAKER_SEGMENT   = 14,
+    TRANSCRIBE_ABI_MODEL_LOAD_PARAMS   = 0,
+    TRANSCRIBE_ABI_SESSION_PARAMS      = 1,
+    TRANSCRIBE_ABI_RUN_PARAMS          = 2,
+    TRANSCRIBE_ABI_STREAM_PARAMS       = 3,
+    TRANSCRIBE_ABI_CAPABILITIES        = 4,
+    TRANSCRIBE_ABI_TIMINGS             = 5,
+    TRANSCRIBE_ABI_SEGMENT             = 6,
+    TRANSCRIBE_ABI_WORD                = 7,
+    TRANSCRIBE_ABI_TOKEN               = 8,
+    TRANSCRIBE_ABI_STREAM_UPDATE       = 9,
+    TRANSCRIBE_ABI_STREAM_TEXT         = 10,
+    TRANSCRIBE_ABI_SESSION_LIMITS      = 11,
+    TRANSCRIBE_ABI_EXT                 = 12,
+    TRANSCRIBE_ABI_DEVICE_INFO         = 13,
+    TRANSCRIBE_ABI_SPEAKER_SEGMENT     = 14,
+    TRANSCRIBE_ABI_BACKEND_INIT_PARAMS = 15,
 } transcribe_abi_struct;
 
 /* sizeof / alignof of the selected public struct, or 0 for an unknown id.
@@ -426,9 +447,12 @@ TRANSCRIBE_API void transcribe_log_set(transcribe_log_callback cb, void * userda
 /* Task / timestamps                                                       */
 /* ----------------------------------------------------------------------- */
 
+/* INSTRUCT: transcribe_run_params::prompt is the instruction and the output
+ * is free text (only full_text / raw_text are guaranteed). Offline only. */
 typedef enum {
     TRANSCRIBE_TASK_TRANSCRIBE = 0,
     TRANSCRIBE_TASK_TRANSLATE  = 1,
+    TRANSCRIBE_TASK_INSTRUCT   = 2,
 } transcribe_task;
 
 /*
@@ -508,7 +532,16 @@ enum transcribe_pnc_mode {
  * transcribe_model_supports(model, TRANSCRIBE_FEATURE_ITN) returns false
  * emit a WARN and proceed with default behavior.
  *
- *   DEFAULT (0): family default. Zero-init gives this value.
+ *   DEFAULT (0): family default. Zero-init gives this value. Most families
+ *                follow their upstream default; `sensevoice` is the
+ *                exception and resolves DEFAULT to ON, because there the
+ *                ITN toggle is also the only source of casing and
+ *                punctuation, so ITN-off would hand an unconfigured caller
+ *                lowercase unpunctuated text. For sensevoice, DEFAULT is
+ *                therefore NOT the setting the published WER tables were
+ *                measured at — the harness pins ITN off (docs/tools/wer.md).
+ *                `funasr_nano` has the same shape of toggle but keeps the
+ *                upstream `itn=False` default.
  *   OFF:         explicit ITN off. Supporting families emit verbatim
  *                spoken-form text. Non-supporting families ignore (WARN).
  *   ON:          explicit ITN on. Supporting families apply ITN.
@@ -794,6 +827,47 @@ TRANSCRIBE_API transcribe_status transcribe_init_backends(const char * artifact_
 TRANSCRIBE_API transcribe_status transcribe_init_backends_default(void);
 
 /*
+ * Allowed-backend mask. Registering a GPU backend runs driver code, so a
+ * broken driver can crash the process before any model loads. A backend
+ * outside the mask is never registered: its module is never opened and its
+ * registration function never runs. CPU (incl. BLAS/ZenDNN) is always
+ * allowed; OTHER covers backends without a bit (SYCL, OpenCL, RPC, ...).
+ *
+ * TRANSCRIBE_BACKENDS=cpu,vulkan,... (also metal, cuda, rocm, other, all)
+ * can only narrow the mask, and applies even if _ex() is never called.
+ *
+ * The mask is fixed at first backend registration (first init call, or in
+ * static builds the first device query / model load). A later call with a
+ * different effective mask returns TRANSCRIBE_ERR_BACKEND. Call once, first.
+ */
+#define TRANSCRIBE_BACKEND_MASK_CPU    0x00000001u
+#define TRANSCRIBE_BACKEND_MASK_METAL  0x00000002u
+#define TRANSCRIBE_BACKEND_MASK_VULKAN 0x00000004u
+#define TRANSCRIBE_BACKEND_MASK_CUDA   0x00000008u
+#define TRANSCRIBE_BACKEND_MASK_ROCM   0x00000010u
+#define TRANSCRIBE_BACKEND_MASK_OTHER  0x80000000u
+#define TRANSCRIBE_BACKEND_MASK_ALL    0xFFFFFFFFu
+
+struct transcribe_backend_init_params {
+    uint64_t     struct_size;      /* sizeof(*this); set by _init() */
+    const char * artifact_dir;     /* NULL: package-local default */
+    uint32_t     allowed_backends; /* TRANSCRIBE_BACKEND_MASK_*; default ALL */
+};
+
+TRANSCRIBE_API void transcribe_backend_init_params_init(struct transcribe_backend_init_params * p);
+
+/*
+ * Fix the mask, then behave as transcribe_init_backends(artifact_dir), or
+ * _default() when artifact_dir is NULL. NULL params means all defaults.
+ * Also returns TRANSCRIBE_ERR_BACKEND if the mask was already fixed to a
+ * different value or no device is registered afterwards.
+ */
+TRANSCRIBE_API transcribe_status transcribe_init_backends_ex(const struct transcribe_backend_init_params * params);
+
+/* The effective mask: the host's (ALL until _ex()) narrowed by the env. */
+TRANSCRIBE_API uint32_t transcribe_allowed_backends(void);
+
+/*
  * Opaque process-local compute-device handle. Handles are owned by the
  * runtime, remain valid for the life of the process, and must not be freed.
  * They may be compared for equality but are not persistent identifiers; use
@@ -1009,8 +1083,9 @@ TRANSCRIBE_API void transcribe_session_params_init(struct transcribe_session_par
  * caller-declared input rate, at which point TRANSCRIBE_ERR_SAMPLE_RATE
  * (currently reserved) will become observable.
  *
- * task:        TRANSCRIBE or TRANSLATE. The model must declare support
- *              for translate via its capabilities; otherwise the run
+ * task:        TRANSCRIBE, TRANSLATE or INSTRUCT. The model must declare
+ *              support for translate via its capabilities, and for
+ *              INSTRUCT via TRANSCRIBE_FEATURE_INSTRUCT; otherwise the run
  *              returns TRANSCRIBE_ERR_UNSUPPORTED_TASK.
  *
  * timestamps:  requested granularity. Default params request AUTO,
@@ -1043,8 +1118,9 @@ TRANSCRIBE_API void transcribe_session_params_init(struct transcribe_session_par
  *
  * target_language: target language for translation tasks, or NULL.
  *
- * String-pointer lifetime (language / target_language): caller-owned, and
- * the library copies what it needs before the API call returns. This holds
+ * String-pointer lifetime (language / target_language / vocabulary /
+ * prompt / prefix): caller-owned, and the library copies what it needs
+ * before the API call returns. This holds
  * for transcribe_run / transcribe_run_batch (synchronous) AND for
  * transcribe_stream_begin: the dispatcher copies these strings into
  * session-owned storage at begin, so the caller may free its params —
@@ -1073,6 +1149,29 @@ TRANSCRIBE_API void transcribe_session_params_init(struct transcribe_session_par
  *              ext` as field 0. Use transcribe_model_accepts_ext_kind
  *              to probe whether the loaded model accepts a given kind
  *              before pointing `family` at it.
+ *
+ * spec_k_drafts: speculative-decode draft length for offline runs: -1 is
+ *              the model default, 0 disables it, >0 drafts K tokens per
+ *              verify pass. Ignored unless the model reports
+ *              transcribe_capabilities::supports_spec_decode.
+ *
+ * Generic prompting (vocabulary, prompt, prefix): NULL / 0 / "" means
+ * unused. Each field is gated by the TRANSCRIBE_FEATURE_* bit in
+ * parentheses; limits are in docs/prompting.md.
+ *
+ * vocabulary / n_vocabulary: custom terms in priority order, formatted for
+ *              the family (VOCABULARY). Ignored with a WARN when
+ *              unsupported.
+ *
+ * prompt:      context text under TRANSCRIBE / TRANSLATE (CONTEXT_PROMPT),
+ *              ignored with a WARN when unsupported; the required
+ *              instruction under INSTRUCT. Plain text only: control-token
+ *              literals are rejected.
+ *
+ * prefix:      transcript text the model continues from
+ *              (TRANSCRIPT_PREFIX). Results hold only the continuation,
+ *              except raw_text. An error when unsupported, and under
+ *              INSTRUCT, batch or streaming.
  */
 struct transcribe_run_params {
     uint64_t struct_size;
@@ -1086,29 +1185,12 @@ struct transcribe_run_params {
     const char *                  target_language;
     bool                          keep_special_tags;
     const struct transcribe_ext * family;
+    int32_t                       spec_k_drafts;
 
-    /*
-     * spec_k_drafts: n-gram-lookup speculative-decode draft length for the
-     *   offline autoregressive decode step. Family-portable strategy knob;
-     *   the family decides how K maps to its internal verify graph.
-     *
-     *   Convention:
-     *     -1: family default (each family picks its tuned K).
-     *      0: spec decoding explicitly disabled — standard 1-token-per-step
-     *         autoregression. Use this for byte-equal reproduction of
-     *         pre-spec behavior or when measuring baseline performance.
-     *     >0: draft K tokens per verify pass. Practical range is 1..8;
-     *         optimal K is hardware-dependent (compute-bound hardware
-     *         prefers small K, bandwidth-bound prefers larger K — see
-     *         docs/models/<family>.md for per-family guidance).
-     *
-     *   Families gate this via transcribe_capabilities::supports_spec_decode.
-     *   Setting spec_k_drafts != -1 on a family with
-     *   supports_spec_decode == false is silently ignored (the run proceeds
-     *   as ordinary autoregression). Probe the capability bit if you want
-     *   to know whether the field will take effect.
-     */
-    int32_t spec_k_drafts;
+    const char * const * vocabulary;
+    int32_t              n_vocabulary;
+    const char *         prompt;
+    const char *         prefix;
 };
 
 TRANSCRIBE_API void transcribe_run_params_init(struct transcribe_run_params * params);
@@ -1188,14 +1270,8 @@ struct transcribe_capabilities {
     bool supports_streaming;
 
     /*
-     * supports_spec_decode: gates transcribe_run_params::spec_k_drafts.
-     *   True means the family's offline (transcribe_run / transcribe_run_batch)
-     *   path implements n-gram-lookup speculative decoding. A non-zero
-     *   spec_k_drafts on a model with supports_spec_decode == false is
-     *   silently ignored — the run proceeds as ordinary autoregression. This
-     *   is a soft gate (no error) because spec is purely a performance
-     *   strategy; callers can probe this bit if they want to know whether
-     *   passing K will actually do anything.
+     * supports_spec_decode: the offline path honors
+     *   transcribe_run_params::spec_k_drafts; elsewhere it is ignored.
      */
     bool supports_spec_decode;
 
@@ -1296,9 +1372,10 @@ TRANSCRIBE_API transcribe_status transcribe_model_get_capabilities(const struct 
  *
  * Feature meanings:
  *
- *   INITIAL_PROMPT       The model accepts a free-text or token
- *                        prompt to bias decoding. Today: whisper
- *                        only; reached via transcribe_whisper_run_ext.
+ *   INITIAL_PROMPT       The Whisper run extension's initial_prompt /
+ *                        prompt_tokens (transcribe_whisper_run_ext).
+ *                        For portable prompting use the generic
+ *                        fields and the four bits below.
  *
  *   TEMPERATURE_FALLBACK The model runs a multi-tier temperature loop
  *                        with metric-driven fallback. Today: whisper.
@@ -1337,6 +1414,15 @@ TRANSCRIBE_API transcribe_status transcribe_model_get_capabilities(const struct 
  *                        against a model where this returns false emits
  *                        a WARN and proceeds.
  *
+ *   VOCABULARY           transcribe_run_params::vocabulary takes effect.
+ *
+ *   CONTEXT_PROMPT       transcribe_run_params::prompt conditions
+ *                        TRANSCRIBE / TRANSLATE.
+ *
+ *   INSTRUCT             TRANSCRIBE_TASK_INSTRUCT is available.
+ *
+ *   TRANSCRIPT_PREFIX    transcribe_run_params::prefix is honored.
+ *
  * Returns false on NULL model or unknown feature enum.
  */
 typedef enum {
@@ -1347,6 +1433,10 @@ typedef enum {
     TRANSCRIBE_FEATURE_PNC                  = 4,
     TRANSCRIBE_FEATURE_ITN                  = 5,
     TRANSCRIBE_FEATURE_DIARIZATION          = 6,
+    TRANSCRIBE_FEATURE_VOCABULARY           = 7,
+    TRANSCRIBE_FEATURE_CONTEXT_PROMPT       = 8,
+    TRANSCRIBE_FEATURE_INSTRUCT             = 9,
+    TRANSCRIBE_FEATURE_TRANSCRIPT_PREFIX    = 10,
 } transcribe_feature;
 
 TRANSCRIBE_API bool transcribe_model_supports(const struct transcribe_model * model, transcribe_feature feature);
@@ -1669,8 +1759,9 @@ TRANSCRIBE_API bool transcribe_was_aborted(const struct transcribe_session * ses
 
 /*
  * Supplemental flag for output truncation. True if the most recent decode
- * stopped at the model's context / generation cap before end-of-stream,
- * leaving the transcript incomplete. The partial transcript is preserved
+ * stopped before end-of-stream, at the model's context / generation cap or
+ * because the output started repeating itself, leaving the transcript
+ * incomplete. The partial transcript is preserved
  * and readable through the normal result accessors. Reset to false at the
  * start of each new decode — transcribe_run, transcribe_run_batch, and
  * transcribe_stream_begin (the same lifecycle as transcribe_was_aborted).
@@ -1679,10 +1770,10 @@ TRANSCRIBE_API bool transcribe_was_aborted(const struct transcribe_session * ses
  * Two paths set it, and they differ in whether a status also reports it:
  *
  *   - Offline (transcribe_run / transcribe_run_batch): the flag is true
- *     exactly when the run returned TRANSCRIBE_ERR_OUTPUT_TRUNCATED (or, in
- *     a batch, when a per-utterance status is OUTPUT_TRUNCATED), so the run
- *     status is the authoritative signal and this accessor is a convenience
- *     for a caller that has lost it.
+ *     exactly when the run returned TRANSCRIBE_ERR_OUTPUT_TRUNCATED or
+ *     TRANSCRIBE_ERR_OUTPUT_REPETITION (or, in a batch, when a per-utterance
+ *     status is one of those), so the run status is the authoritative signal
+ *     and this accessor is a convenience for a caller that has lost it.
  *
  *   - Streaming (transcribe_stream_*): OUTPUT_TRUNCATED is NOT used. An
  *     active stream has its own terminal-state machine, and stream_feed /
@@ -1691,7 +1782,9 @@ TRANSCRIBE_API bool transcribe_was_aborted(const struct transcribe_session * ses
  *     reached its absolute position cap (forcing the stream to FAILED would
  *     discard the committed text the caller has been consuming). There, this
  *     flag is the ONLY signal of truncation: a streaming caller must check
- *     it after finalize.
+ *     it after finalize. A family that re-decodes the stream from the start
+ *     on each feed (moonshine_streaming) sets it from its latest decode, so
+ *     after finalize it describes the final transcript.
  *
  * Distinct from the "couldn't start" rejection: input that cannot fit at
  * all is rejected before the decode with TRANSCRIBE_ERR_INPUT_TOO_LONG;

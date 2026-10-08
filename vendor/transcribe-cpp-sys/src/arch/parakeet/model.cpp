@@ -56,18 +56,6 @@ static_assert(std::is_base_of_v<transcribe_model, ParakeetModel>);
 static_assert(std::is_base_of_v<transcribe_session, ParakeetSession>);
 
 ParakeetSession::~ParakeetSession() {
-    // Tear down per-call compute state before the model's backend plan
-    // (which outlives the context): scheduler, then context.
-    if (sched != nullptr) {
-        safe_sched_free(sched);
-        sched = nullptr;
-    }
-    if (compute_ctx != nullptr) {
-        ggml_free(compute_ctx);
-        compute_ctx = nullptr;
-    }
-    encoder_out = nullptr;
-
     // Streaming cache tensors live in their own ggml_context + backend
     // buffer. Free buffer first (may hold a backend ref), then the ctx.
     if (stream_caches.buffer != nullptr) {
@@ -94,6 +82,11 @@ ParakeetSession::~ParakeetSession() {
     stream_caches.last_k.clear();
     stream_caches.last_v.clear();
     stream_caches.initialized = false;
+}
+
+// Base release_scratch has freed sched/compute_ctx; drop what pointed into them.
+void ParakeetSession::on_scratch_released() noexcept {
+    encoder_out = nullptr;
 }
 
 ParakeetModel::~ParakeetModel() {
@@ -222,7 +215,7 @@ transcribe_status fuse_batch_norm(ParakeetModel & m) {
     ggml_init_params params   = { ctx_size, nullptr, /*no_alloc=*/true };
     m.bn_fused_ctx            = ggml_init(params);
     if (m.bn_fused_ctx == nullptr) {
-        return TRANSCRIBE_ERR_BACKEND;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     // Create all tensors first, then allocate a buffer.
@@ -235,7 +228,7 @@ transcribe_status fuse_batch_norm(ParakeetModel & m) {
     // Allocate on the CPU backend (always last in the scheduler list).
     m.bn_fused_buffer = ggml_backend_alloc_ctx_tensors(m.bn_fused_ctx, m.plan.scheduler_list.back());
     if (m.bn_fused_buffer == nullptr) {
-        return TRANSCRIBE_ERR_BACKEND;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     // Compute fused values from the raw BN tensors.
@@ -358,7 +351,7 @@ transcribe_status init_streaming_caches(ParakeetSession * pc, ParakeetModel * pm
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet stream init_caches: backend buffer alloc failed");
         ggml_free(pc->stream_caches.ctx);
         pc->stream_caches.ctx = nullptr;
-        return TRANSCRIBE_ERR_BACKEND;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     pc->stream_caches.channel_len         = 0;
@@ -540,7 +533,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     if (weights_buffer == nullptr) {
         gguf_free(gguf_data);
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
     m->backend_buffer = weights_buffer;
     ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -686,10 +679,13 @@ static bool is_lang_tag_piece(const std::string & p) {
 }
 
 // Drop this piece from the public result when keep_special_tags is off:
-// stripped if CONTROL-typed or matching the <ll-RR> locale-tag pattern
-// (transitional fallback). Shared by the offline and streaming builders.
+// the shared Tokenizer::is_strippable_special set (CONTROL, UNKNOWN /
+// <unk>; see its comment for why nemotron-3.5 emits <unk>) plus the
+// <ll-RR> locale-tag pattern (transitional fallback for GGUFs predating
+// the converter marking them CONTROL). Shared by the offline and
+// streaming builders.
 static bool is_strippable_special(const transcribe::Tokenizer & tok, int id) {
-    return tok.is_control(id) || is_lang_tag_piece(tok.token(id));
+    return tok.is_strippable_special(id) || is_lang_tag_piece(tok.token(id));
 }
 
 // Collapse runs of ASCII spaces to one and trim both ends — cleans up the
@@ -804,10 +800,9 @@ transcribe_status build_result_from_raw_tokens(ParakeetSession *             pc,
     const transcribe::Tokenizer & tok = pm->tok;
 
     pc->tokens.reserve(pc->raw_tokens.size());
-    // Strip multilingual <ll-RR> language tags by default (gated on
-    // keep_special_tags / CLI --raw-tokens). Detection is
-    // Tokenizer::is_control (CONTROL token_type); is_lang_tag_piece is a
-    // transitional fallback for GGUFs predating that converter change.
+    // Strip special pieces (multilingual <ll-RR> language tags, <unk>) by
+    // default (gated on keep_special_tags / CLI --raw-tokens). See
+    // is_strippable_special for the detection rules.
     const bool strip_tags = (params == nullptr) ? true : !params->keep_special_tags;
     for (const TdtToken & rt : pc->raw_tokens) {
         if (strip_tags && is_strippable_special(tok, rt.id)) {
@@ -1041,7 +1036,7 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
         pc->compute_ctx        = ggml_init(init_params);
         if (pc->compute_ctx == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet run: ggml_init for compute_ctx failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_OOM;
         }
     }
 
@@ -1091,13 +1086,13 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
                                            /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
         if (pc->sched == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet run: ggml_backend_sched_new failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(pc->sched);
     if (!ggml_backend_sched_alloc_graph(pc->sched, eb.graph)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet run: ggml_backend_sched_alloc_graph failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     // Upload the mel; the row-major [num_mels, n_frames] buffer is
@@ -1253,7 +1248,7 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
     if (const ggml_status gs = ggml_backend_sched_graph_compute(pc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet run: ggml_backend_sched_graph_compute failed (%d)",
                 static_cast<int>(gs));
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     pc->t_encode_us = ggml_time_us() - t_enc_start;
     pc->t_decode_us = 0;
@@ -1423,7 +1418,7 @@ static transcribe_status run_batch_encode(ParakeetSession *                     
         init_params.no_alloc   = true;
         pc->compute_ctx        = ggml_init(init_params);
         if (pc->compute_ctx == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_OOM;
         }
     }
 
@@ -1447,12 +1442,12 @@ static transcribe_status run_batch_encode(ParakeetSession *                     
                                            static_cast<int>(pm->plan.scheduler_list.size()),
                                            /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
         if (pc->sched == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(pc->sched);
     if (!ggml_backend_sched_alloc_graph(pc->sched, eb.graph)) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     ggml_backend_tensor_set(eb.mel_in, pc->mel_buf.data(), 0, pc->mel_buf.size() * sizeof(float));
@@ -1587,7 +1582,7 @@ static transcribe_status run_batch_encode(ParakeetSession *                     
     const int64_t t_enc_start = ggml_time_us();
     if (const ggml_status gs = ggml_backend_sched_graph_compute(pc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet run_batch: graph_compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     pc->t_encode_us = ggml_time_us() - t_enc_start;
 
@@ -1887,7 +1882,7 @@ transcribe_status ensure_pos_proj_cache(ParakeetSession * pc, ParakeetModel * pm
     transcribe_status st = TRANSCRIBE_OK;
     ggml_backend_sched_reset(pc->sched);
     if (!ggml_backend_sched_alloc_graph(pc->sched, graph)) {
-        st = TRANSCRIBE_ERR_BACKEND;
+        st = TRANSCRIBE_ERR_OOM;
     } else {
         ggml_backend_tensor_set(pos_in, pc->pos_buf.data(), 0, static_cast<size_t>(pos_len) * d_model * sizeof(float));
         if (ggml_backend_sched_graph_compute(pc->sched, graph) != GGML_STATUS_SUCCESS) {
@@ -2059,7 +2054,7 @@ transcribe_status emit_streaming_chunk(ParakeetSession * pc,
     ggml_backend_sched_reset(pc->sched);
     if (!ggml_backend_sched_alloc_graph(pc->sched, eb.graph)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet stream: alloc_graph failed");
-        return TRANSCRIBE_ERR_BACKEND;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     // Upload mel chunk. Row-major [n_mels, n_mel_chunk_frames] is
@@ -2133,7 +2128,7 @@ transcribe_status emit_streaming_chunk(ParakeetSession * pc,
 
     if (const ggml_status gs = ggml_backend_sched_graph_compute(pc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet stream: graph_compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
 
     // Read encoder output back to host.
@@ -2257,7 +2252,7 @@ void rebuild_streaming_result_text(ParakeetSession * pc, const ParakeetModel * p
 
     const double frame_to_ms = parakeet_ms_per_enc_frame(pm->hparams);
 
-    // Strip CONTROL / <ll-RR> tag pieces from the public result, mirroring
+    // Strip CONTROL / UNKNOWN / <ll-RR> pieces from the public result, mirroring
     // decode_and_populate (gated on keep_special_tags). Only the public
     // projection is filtered; pc->raw_tokens stays whole.
     const transcribe::Tokenizer & tok        = pm->tok;
@@ -2292,6 +2287,13 @@ void rebuild_streaming_result_text(ParakeetSession * pc, const ParakeetModel * p
         }
         pc->raw_text = tok.decode(raw_ids.data(), static_cast<int>(raw_ids.size()));
     }
+    if (pc->buf_active) {
+        const int64_t max_ms = us_to_ms(pc->stream_audio_input_us);
+        for (auto & token : pc->tokens) {
+            token.t1_ms = std::min(token.t1_ms, max_ms);
+            token.t0_ms = std::min(token.t0_ms, token.t1_ms);
+        }
+    }
     pc->has_result  = true;
     pc->result_kind = TRANSCRIBE_TIMESTAMPS_TOKEN;
 }
@@ -2300,12 +2302,8 @@ void rebuild_streaming_result_text(ParakeetSession * pc, const ParakeetModel * p
 //
 // Mirrors NeMo's speech_to_text_streaming_infer_rnnt.py. Variable-stride
 // per step: step 0 num_new = samples_chunk + samples_right; steady state
-// num_new = samples_chunk; the final step (finalize) consumes the rest
-// and folds the right slot into chunk. Each step updates the buffer's
-// ContextSize (buf_ctx_*), slices the encoder window, computes mel,
-// builds the graph with a BufferedStreamMaskOverride, then slices off the
-// ctx_left frames and decodes ctx_chunk (or all remaining on last) with a
-// carried RNN-T LstmState.
+// num_new = samples_chunk. Finalize folds the retained right slot and any
+// ragged tail into the decoded chunk.
 static void buf_ctx_add_frames(ParakeetSession * pc, int64_t num_new, bool is_last) {
     pc->buf_ctx_left += pc->buf_ctx_chunk;
     pc->buf_ctx_chunk = 0;
@@ -2324,10 +2322,13 @@ static void buf_ctx_add_frames(ParakeetSession * pc, int64_t num_new, bool is_la
     pc->buf_ctx_left -= extra;
 }
 
+// The final chunk may append silence for right-context lookahead. Padding
+// extends the decoded window but never advances the real-audio cursor.
 transcribe_status emit_buffered_chunk(ParakeetSession * pc,
                                       ParakeetModel *   pm,
                                       int64_t           num_new_samples,
-                                      bool              is_last_chunk) {
+                                      bool              is_last_chunk,
+                                      int64_t           eos_pad_samples = 0) {
     if (pc->poll_abort()) {
         return TRANSCRIBE_ERR_ABORTED;
     }
@@ -2345,9 +2346,10 @@ transcribe_status emit_buffered_chunk(ParakeetSession * pc,
 
     // ----- Update buffer ContextSize (mirrors NeMo's add_frames_get_removed_) -----
     buf_ctx_add_frames(pc, num_new_samples, is_last_chunk);
+    pc->buf_ctx_chunk += eos_pad_samples;
 
     // ----- Build the [left | chunk | right] PCM window from absolute coords -----
-    const int64_t end_abs     = pc->buf_next_audio_read + num_new_samples;
+    const int64_t end_abs     = pc->buf_next_audio_read + num_new_samples + eos_pad_samples;
     const int64_t total_now   = pc->buf_ctx_left + pc->buf_ctx_chunk + pc->buf_ctx_right;
     const int     effective_T = static_cast<int>(total_now / samples_per_frame);
     const int64_t start_abs   = end_abs - total_now;
@@ -2405,7 +2407,7 @@ transcribe_status emit_buffered_chunk(ParakeetSession * pc,
         pc->compute_ctx        = ggml_init(init_params);
         if (pc->compute_ctx == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet buffered: ggml_init for compute_ctx failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_OOM;
         }
     }
 
@@ -2435,12 +2437,12 @@ transcribe_status emit_buffered_chunk(ParakeetSession * pc,
                                            static_cast<int>(pm->plan.scheduler_list.size()),
                                            /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
         if (pc->sched == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(pc->sched);
     if (!ggml_backend_sched_alloc_graph(pc->sched, eb.graph)) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
     ggml_backend_tensor_set(eb.mel_in, pc->mel_buf.data(), 0, pc->mel_buf.size() * sizeof(float));
 
@@ -2503,7 +2505,7 @@ transcribe_status emit_buffered_chunk(ParakeetSession * pc,
     const int64_t t_enc_start = ggml_time_us();
     if (const ggml_status gs = ggml_backend_sched_graph_compute(pc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet buffered: sched_graph_compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     pc->t_encode_us += ggml_time_us() - t_enc_start;
 
@@ -2831,6 +2833,8 @@ transcribe_status stream_begin(transcribe_session *             session,
         return TRANSCRIBE_ERR_NOT_IMPLEMENTED;
     }
 
+    pc->stream_audio_input_samples = 0;
+
     // -------- Buffered streaming path (parakeet-unified-en-0.6b) --------
     //
     // chunked_limited_with_rc with a 3-tuple training menu. Re-runs the
@@ -2961,7 +2965,8 @@ transcribe_status stream_feed(transcribe_session *       session,
     }
 
     pc->stream_pcm_buffer.insert(pc->stream_pcm_buffer.end(), pcm, pcm + n_samples);
-    pc->stream_audio_input_us += samples_to_us(n_samples);
+    pc->stream_audio_input_samples += n_samples;
+    pc->stream_audio_input_us = samples_to_us(pc->stream_audio_input_samples);
 
     const int prev_n_tokens = static_cast<int>(pc->raw_tokens.size());
 
@@ -2979,6 +2984,7 @@ transcribe_status stream_feed(transcribe_session *       session,
     // job). Step 0 needs samples_chunk + samples_right; steady-state
     // needs samples_chunk.
     if (pc->buf_active) {
+        bool emitted = false;
         while (true) {
             if (pc->poll_abort()) {
                 return TRANSCRIBE_ERR_ABORTED;
@@ -2994,6 +3000,7 @@ transcribe_status stream_feed(transcribe_session *       session,
                 st != TRANSCRIBE_OK) {
                 return st;
             }
+            emitted = true;
         }
         const bool tokens_changed = static_cast<int>(pc->raw_tokens.size()) != prev_n_tokens;
         if (tokens_changed) {
@@ -3002,8 +3009,10 @@ transcribe_status stream_feed(transcribe_session *       session,
             pc->n_committed_words    = 0;
             pc->n_committed_segments = 0;
             pc->stream_revision += 1;
-            pc->stream_audio_committed_us =
-                pc->buf_next_audio_read * 1000000LL / std::max<int64_t>(pm->hparams.fe_sample_rate, 1);
+        }
+        if (emitted) {
+            // The retained right slot has been read but not decoded.
+            pc->stream_audio_committed_us = samples_to_us(pc->buf_next_audio_read - pc->buf_ctx_right);
         }
         if (update != nullptr) {
             update->result_changed     = tokens_changed;
@@ -3183,18 +3192,19 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
     const int prev_n_tokens = static_cast<int>(pc->raw_tokens.size());
 
     // -------- Buffered streaming finalize --------
-    //
-    // One final emit consuming all remaining audio with is_last_chunk=true;
-    // add_frames_get_removed_ folds the right slot + this num_new into the
-    // chunk slot so the decoder gets every frame past ctx_left (no zero-pad).
+    // Flush retained right context even when the read cursor is already at
+    // EOS, then append R frames of silence so the final speech frames keep
+    // their trained lookahead. Synthetic samples are not counted as input.
     if (pc->buf_active) {
         const int64_t total = static_cast<int64_t>(pc->stream_pcm_buffer.size());
-        if (pc->buf_next_audio_read < total) {
+        // An exact C+R+k*C input leaves right context retained at EOS.
+        if (pc->buf_next_audio_read < total || pc->buf_ctx_right > 0) {
             if (pc->poll_abort()) {
                 return TRANSCRIBE_ERR_ABORTED;
             }
             const int64_t num_new = total - pc->buf_next_audio_read;
-            if (const transcribe_status st = emit_buffered_chunk(pc, pm, num_new, /*is_last_chunk=*/true);
+            const int64_t eos_pad = static_cast<int64_t>(pc->buf_samples_right);
+            if (const transcribe_status st = emit_buffered_chunk(pc, pm, num_new, /*is_last_chunk=*/true, eos_pad);
                 st != TRANSCRIBE_OK) {
                 return st;
             }
@@ -3305,6 +3315,7 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
 void stream_reset(transcribe_session * session) {
     auto * pc = static_cast<ParakeetSession *>(session);
     pc->stream_pcm_buffer.clear();  // keep the allocation
+    pc->stream_audio_input_samples = 0;
 }
 
 // Kind+slot probe. No run-slot extensions (always false on _RUN). On
